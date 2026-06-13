@@ -59,139 +59,55 @@ s03 的循环和权限逻辑完全保留。唯一的变动是把 `check_permissi
 
 ## 工作原理
 
-**hook 注册表**：一个字典，事件名映射到回调列表。
+**核心抽象**：`HookBus` 是事件→订阅者列表的映射。Agent 循环不直接调用任何业务逻辑——只 fire 事件，由订阅者决定做什么。订阅者分两类：
+
+- **外部命令**：从 `appsettings.json` 的 `hooks` 段读出来，运行时 spawn 进程跑。**教学版只走这条路。**
+- **C# 委托**：通过 `OnPreToolUse` / `OnPostToolUse` / `OnStop` / `OnUserPromptSubmit` / `OnBeforeLlmCall` 注册，留在进程内。保留这条 API 是给"需要进程内状态/TTY 交互"的少数场景。
+
+s04 的 `Program.cs` 一行 `OnXxx` 都没有：
 
 ```csharp
-var hooks = new HookBus();
-
-hooks.OnUserPromptSubmit(query => { });
-hooks.OnPreToolUse(block => null);   // non-null return blocks the tool
-hooks.OnPostToolUse((block, output) => { });
-hooks.OnStop(() => null);   // non-null return forces continuation
+var n = agent.Hooks.ConfigureExternal(
+    config.Hooks, workDir,
+    log: msg => Console.Error.WriteLine(msg),
+    timeout: TimeSpan.FromSeconds(30));
 ```
 
-教学版中，PreToolUse 的非 None 返回值会阻止本次工具执行，Stop 的非 None 返回值会强制续跑。UserPromptSubmit 和 PostToolUse 的返回值未被使用。
+——全部行为从 `appsettings.json` 读，循环代码原封不动。
 
-**UserPromptSubmit**，用户输入提交后、进入 LLM 前触发。CC 中可以拦截或修改输入，教学版只做日志演示：
+**四个事件**覆盖完整 agent cycle：
 
-```csharp
-void ContextInjectHook(string query)
-{
-    Console.WriteLine($"\u001b[90m[HOOK] UserPromptSubmit: working in {workDir}\u001b[0m");
-}
+| 事件 | 触发时机 | stdin 载荷 | 典型用途 |
+|------|---------|-----------|---------|
+| `UserPromptSubmit` | 用户输入后、LLM 调用前 | `{hookEventName, userPrompt}` | 日志、注入上下文 |
+| `PreToolUse` | 工具执行前 | `{hookEventName, toolName, toolInput}` | 权限检查、白名单/黑名单 |
+| `PostToolUse` | 工具执行后 | `{hookEventName, toolName, toolInput, toolOutput}` | 审计、副作用、输出检查 |
+| `Stop` | 循环即将退出 | `{hookEventName, sessionStats:{toolCalls}}` | 收尾、写 session.json |
 
-agent.Hooks.OnUserPromptSubmit(ContextInjectHook);
+**协议**（与 Python CC 一致）：
+
+| exit | 含义 |
+|------|------|
+| `0` | 允许 |
+| `2` | 阻止；stderr（或 stdout）作原因 |
+| 其它 | 非阻塞错误；bus 打警告，仍然允许 |
+
+可选 stdout JSON 可覆盖 exit code 行为：
+
+```jsonc
+{ "decision": "block", "reason": "..." }
 ```
 
-在主循环中，用户输入后立即触发：
+**Matcher 语法**（每条 group 上）：
 
-```csharp
-var query = Console.ReadLine() ?? "";
-agent.FireUserPromptSubmit(query);    // ← before entering LLM
-history.Add(Message.UserText(query));
-await agent.RunUntilDoneAsync(history);
-```
+| 模式 | 匹配 |
+|------|------|
+| 留空 / `null` | 所有工具 |
+| `"bash"` | 精确 |
+| `"bash*"` | 前缀 |
+| `"/regex/"` | 正则（`/.../` 包裹） |
 
-**PreToolUse / PostToolUse**，工具执行前后的 hook。s03 的权限检查逻辑现在包装成 PreToolUse hook，再加一个日志 hook 和一个大输出提醒：
-
-```csharp
-// PreToolUse: permission check (s03 logic, moved from loop to hook)
-string? PermissionHook(ToolUseBlock block)
-{
-    if (block.Name == "bash")
-    {
-        var cmd = block.Input.TryGetProperty("command", out var c) ? c.GetString() ?? "" : "";
-        foreach (var pattern in denyList)
-        {
-            if (cmd.Contains(pattern, StringComparison.Ordinal))
-                return "Permission denied by deny list";
-        }
-    }
-    if (block.Name is "write_file" or "edit_file"
-        && block.Input.TryGetProperty("path", out var p) && p.ValueKind == JsonValueKind.String)
-    {
-        try { _ = PathGuard.SafePath(workDir, p.GetString() ?? ""); }
-        catch
-        {
-            Console.Write("   Allow? [y/N] ");
-            var choice = (Console.ReadLine() ?? "").Trim().ToLowerInvariant();
-            if (choice is not ("y" or "yes")) return "Permission denied by user";
-        }
-    }
-    return null;
-}
-
-// PreToolUse: logging
-void LogHook(ToolUseBlock block)
-{
-    Console.WriteLine($"[HOOK] {block.Name}(...)");
-}
-
-// PostToolUse: large output reminder
-void LargeOutputHook(ToolUseBlock block, string output)
-{
-    if (output.Length > 100_000)
-        Console.WriteLine($"[HOOK] ⚠ Large output from {block.Name}");
-}
-
-agent.Hooks.OnPreToolUse(PermissionHook);
-agent.Hooks.OnPreToolUse(LogHook);
-agent.Hooks.OnPostToolUse(LargeOutputHook);
-```
-
-**Stop**，循环即将退出时触发（`stop_reason != "tool_use"`）。教学版用于打印收尾统计：
-
-```csharp
-string? SummaryHook(IReadOnlyList<Message>? messages)
-{
-    var toolCount = messages?
-        .SelectMany(m => m.Content)
-        .OfType<ToolResultBlock>()
-        .Count() ?? 0;
-    Console.WriteLine($"\u001b[90m[HOOK] Stop: session used {toolCount} tool calls\u001b[0m");
-    return null;   // return null = allow stop, return string = force continuation
-}
-
-agent.Hooks.OnStop(SummaryHook);
-```
-
-在 agent_loop 中，退出前触发：
-
-```csharp
-if (response.StopReason != "tool_use")
-{
-    var force = agent.Hooks.FireStopOnHistory(messages);   // ← before exiting
-    if (force is not null)
-    {
-        // hook returned a message → inject it and continue
-        messages.Add(Message.UserText(force));
-        continue;
-    }
-    return;
-}
-```
-
-**循环里只改了一处**：s03 直接调用 `check_permission(block)`，s04 改为 `trigger_hooks("PreToolUse", block)`：
-
-```csharp
-foreach (var block in response.Content.OfType<ToolUseBlock>())
-{
-    // s03: if (!CheckPermission(block)) { ... }
-    // s04: hooks replace hardcoding
-    var blocked = agent.Hooks.FirePreToolUse(block);
-    if (blocked is not null)
-    {
-        results.Add(new ToolResultBlock(block.Id, blocked));
-        continue;
-    }
-
-    var output = tools.Invoke(block.Name, block.Input);
-    agent.Hooks.FirePostToolUse(block, output);
-    results.Add(new ToolResultBlock(block.Id, output));
-}
-```
-
-四个 hook 覆盖了 agent cycle 的关键节点：输入→执行前→执行后→退出。循环只负责调用 trigger_hooks()，具体逻辑全在 hook 回调里。
+**AgentCommon/Agent/AgentHarness.cs 的循环只改了一处**：s03 直接调用 `check_permission(block)`，s04 改为 `await Hooks.FirePreToolUseAsync(block, ct)`。其他 fire 点位是 `BeforeLlmCall`（在 `RunAsync` 开头）、`PostToolUse`（工具执行后）、`FireStopOnHistory`（循环退出前）。外部脚本与内联委托并排运行——第一个返回 block reason 的胜出，stderr 进模型对话。
 
 ---
 
@@ -199,12 +115,149 @@ foreach (var block in response.Content.OfType<ToolUseBlock>())
 
 | 组件 | 之前 (s03) | 之后 (s04) |
 |------|-----------|-----------|
-| 扩展方式 | check_permission() 硬编码在循环里 | HOOKS 注册表 + trigger_hooks() |
-| 新函数 | — | register_hook, trigger_hooks |
-| hook 回调 | — | context_inject_hook, permission_hook, log_hook, large_output_hook, summary_hook |
-| 循环 | 直接调用 check_permission() | 调用 trigger_hooks("PreToolUse", ...) |
-| 退出控制 | 无 | trigger_hooks("Stop", ...) 可阻止退出 |
-| 输入拦截 | 无 | trigger_hooks("UserPromptSubmit", ...) 可注入上下文 |
+| 扩展方式 | `check_permission()` 硬编码在循环里 | `HookBus` + `appsettings.json` 里的 `hooks` 段 |
+| hook 定义位置 | C# 代码里的内联委托 | JSON 配置指向外部 JS/TS/任意脚本 |
+| 加载时机 | 编译期绑定 | 启动时由 `ConfigureExternal` 动态加载 |
+| 新类型 | — | `HooksConfig` / `HookGroup` / `HookCommand` / `ExternalHookEntry` / `ExternalHookRunner` / `ExternalHookLoader` |
+| 循环 | 直接调用 `check_permission()` | `await Hooks.FirePreToolUseAsync(block, ct)` |
+| 退出控制 | 无 | `FireStopOnHistoryAsync` 可阻止退出 |
+| 输入拦截 | 无 | `FireUserPromptSubmitAsync` 可注入上下文 |
+| 协议 | — | CC 兼容：stdin = 事件 JSON，exit 0/2 决定 allow/block |
+
+---
+
+## 外部 hook 脚本：JS / TS 也能挂上
+
+教学版上面的 hook 全部是 C# 委托（`OnPreToolUse(...)` 等）。CC 的真实 hook 模型不仅如此——它允许在 `settings.json` 里把事件指向一个**外部命令**，命令的 stdin 收到事件 JSON，exit code 决定结果。Python CC 里这些外部命令是任意可执行文件：`.py`、`.sh`、`.ps1`、`.exe`… 主流生态（Cline、Roo、Continue）清一色用 **JavaScript / TypeScript** 写，所以本节把它做成 C# 版的"第一类公民"。
+
+### 配置：在 `appsettings.json` 里挂命令
+
+```jsonc
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "bash",
+        "hooks": [ { "type": "command", "command": "node hooks/block-rm.js" } ] }
+    ],
+    "PostToolUse": [
+      { "hooks": [ { "type": "command", "command": "node hooks/audit-log.js" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "npx tsx hooks/summary.ts" } ] }
+    ]
+  }
+}
+```
+
+- `matcher` 留空 = 匹配所有工具；`"bash"` = 精确匹配；`"bash*"` = 前缀匹配；`"/regex/"` = 正则。
+- `command` 走**不带 shell** 的 argv 解析，单/双引号分组空白字符。
+- 第一个 token 是可执行文件（`node`/`tsx`/`npx`/`py`/…），后面是参数。运行时由用户决定，本项目不内嵌 JS 引擎。
+
+### 协议：stdin / exit code / 可选 stdout
+
+事件以 JSON 形式从 stdin 写入脚本：
+
+| 事件 | 写入 stdin 的 JSON |
+|------|------|
+| `PreToolUse` | `{ "hookEventName":"PreToolUse", "toolName":"bash", "toolInput":{ "command":"..." } }` |
+| `PostToolUse` | `{ "hookEventName":"PostToolUse", "toolName":"bash", "toolInput":{...}, "toolOutput":"..." }` |
+| `UserPromptSubmit` | `{ "hookEventName":"UserPromptSubmit", "userPrompt":"..." }` |
+| `Stop` | `{ "hookEventName":"Stop", "sessionStats":{ "toolCalls": 5 } }` |
+
+退出码语义（与 Python CC 一致）：
+
+| exit | 含义 |
+|------|------|
+| `0` | 允许 |
+| `2` | 阻止；stderr（或 stdout）作为原因 |
+| 其它 | 非阻塞错误；bus 打印警告，仍然允许 |
+
+可选 stdout JSON 可覆盖 exit code 行为：
+
+```jsonc
+// 写到 stdout
+{ "decision": "block", "reason": "rm -rf / is not allowed" }
+```
+
+TS 用户用 `npx tsx hooks/foo.ts` 即可，运行时不挑——`node`/`bun`/`deno`/`tsx`/`ts-node` 都行，配置时换第一个 token 即可。
+
+### 完整示例：阻止 `rm -rf`
+
+`hooks/block-rm.js`：
+
+```javascript
+const DENY = [/\brm\s+-rf?\s+\//, /\bsudo\b/, /\bshutdown\b|\breboot\b/, /\bmkfs\b/, /\bdd\s+if=/];
+
+(async () => {
+  const event = JSON.parse(await readStdin());
+  if (event.toolName !== "bash") process.exit(0);
+  const cmd = (event.toolInput && event.toolInput.command) || "";
+  for (const pat of DENY) {
+    if (pat.test(cmd)) {
+      console.error(`denied by ${pat}`);
+      process.exit(2);  // 2 = block, stderr becomes the reason
+    }
+  }
+  process.exit(0);
+})();
+```
+
+`appsettings.json`：
+
+```jsonc
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "bash",
+        "hooks": [ { "type": "command", "command": "node hooks/block-rm.js" } ] }
+    ]
+  }
+}
+```
+
+s04 的 `Program.cs` 启动时做一件事——把所有外部 hook 一次性挂上：
+
+```csharp
+var n = agent.Hooks.ConfigureExternal(
+    config.Hooks, workDir,
+    log: msg => Console.Error.WriteLine(msg),
+    timeout: TimeSpan.FromSeconds(30));
+if (n > 0) Console.WriteLine($"[host] loaded {n} external hook(s) from appsettings.json");
+```
+
+`ConfigureExternal(config, workDir, log?, timeout?)` 在 `HookBus` 上做三件事：注入 `ExternalRunner`、设置 `WorkDir`、调用 `ExternalHookLoader` 把 `hooks.<Event>[]` 段下的每条 `command` 注册为外部订阅者。`appsettings.json` 没有 `hooks` 段就什么都不做，return 0。启动时调一次即可——之后内联委托和外部脚本并排运行，第一个拒绝的 hook 胜出。
+
+### 不在范围内（教学版简化）
+
+- **内嵌 V8/Jint**：会引入重量级依赖，TS 还得我们内嵌转译器。
+- **CSX（Roslyn scripting）**：C# 限定，与"AI 工具生态以 JS/TS 为主"的现实不符。
+- **进程级沙箱**：timeout 默认 30s（可配），不做 cgroup/AppContainer 隔离。
+- **hook allow vs deny/ask 优先级**：本项目无 settings.json 层，没有 CC `toolHooks.ts:325-331` 的优先级合并逻辑。
+
+---
+
+## 自带的脚本：把示例跑起来
+
+`hooks/` 下放了七个示例脚本，复制 `appsettings.example.json` → `appsettings.json` 即可全部启用。**教学版默认就是这种"全部 hook 来自配置"的形态**——`Program.cs` 一行 `OnXxx` 都没有。
+
+| 脚本 | 事件 | 匹配 | 行为 |
+|------|------|------|------|
+| `block-rm.js` | PreToolUse | `bash` | 黑名单：阻断 `rm -rf /`、`sudo`、`shutdown`、`reboot`、`mkfs`、`dd if=` |
+| `path-guard.js` | PreToolUse | `write_file\|edit_file` | 拒绝写到 cwd 之外的目标（exit 2） |
+| `log-pretool.js` | PreToolUse | 全部 | 把 `toolName(key=val, …)` 打到 stderr |
+| `log-prompt.js` | UserPromptSubmit | — | 把 `cwd=` 和 prompt 截断 60 字打到 stderr |
+| `large-output.js` | PostToolUse | 全部 | 工具输出 > 100_000 字符时打警告 |
+| `audit-log.js` | PostToolUse | 全部 | 每个 tool call 追加一行 JSONL 到 `.memory/audit.log` |
+| `summary.ts` | Stop | — | 写 `.memory/session.json`（需要 `npx tsx`） |
+
+每个脚本都可独立运行做单元测试：
+
+```sh
+echo '{"hookEventName":"PreToolUse","toolName":"bash","toolInput":{"command":"sudo apt update"}}' | node hooks/block-rm.js
+# → exit 2, stderr: "block-rm: denied by pattern /\bsudo\b/"
+```
+
+要禁用某一类 hook：注释掉 `appsettings.json` 里对应的那一段；要换实现：把 `command` 指向你的脚本。循环代码不用动。
 
 ---
 
@@ -220,8 +273,9 @@ dotnet run --project s04_hooks
 1. `Read the file README.md`（应该直接通过，观察 hook 日志）
 2. `Create a file called test.txt`（通过后观察 PostToolUse 是否触发）
 3. `Delete all temporary files in /tmp`（bash + rm 触发权限 hook）
+4. `Write something to ../../../etc/passwd`（path-guard 拒绝，exit 2）
 
-观察重点：每次工具执行前，是否出现了 `[HOOK]` 日志？权限被拒时，是 hook 拦截的还是循环里硬编码的？
+观察重点：每次工具执行前，是否出现了 `[HOOK]` 日志？权限被拒时，是 `block-rm.js` / `path-guard.js` 拦截的，还是循环里硬编码的？——答案应该是前者：s04 的 `Program.cs` 里没有任何权限相关代码。
 
 ---
 
@@ -291,4 +345,4 @@ PostToolUse hooks 返回 `preventContinuation: true` 时，会产生一个 `hook
 
 </details>
 
-<!-- translation-sync: zh@v1, en@v0, ja@v0 -->
+<!-- translation-sync: zh@v1, en@v1, ja@v0 -->

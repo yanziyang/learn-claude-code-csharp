@@ -59,139 +59,55 @@ Extensions are added via `register_hook()`. The loop only calls `trigger_hooks()
 
 ## How It Works
 
-**Hook registry**: a dict mapping event names to callback lists.
+**Core abstraction**: `HookBus` is an event→subscribers map. The agent loop never calls any business logic directly — it just fires events, and subscribers decide what to do. There are two flavors of subscriber:
+
+- **External commands**: read from the `hooks` section of `appsettings.json` and spawned at runtime. **The teaching version uses only this path.**
+- **C# delegates**: registered via `OnPreToolUse` / `OnPostToolUse` / `OnStop` / `OnUserPromptSubmit` / `OnBeforeLlmCall`, in-process. The API is kept for the few cases that genuinely need in-process state or TTY interaction.
+
+`s04_hooks/Program.cs` has zero `OnXxx` calls:
 
 ```csharp
-var hooks = new HookBus();
-
-hooks.OnUserPromptSubmit(query => { });
-hooks.OnPreToolUse(block => null);   // non-null return blocks the tool
-hooks.OnPostToolUse((block, output) => { });
-hooks.OnStop(() => null);   // non-null return forces continuation
+var n = agent.Hooks.ConfigureExternal(
+    config.Hooks, workDir,
+    log: msg => Console.Error.WriteLine(msg),
+    timeout: TimeSpan.FromSeconds(30));
 ```
 
-In the teaching version, PreToolUse returning non-None means block execution; Stop returning non-None means force continuation. UserPromptSubmit and PostToolUse return values are unused.
+All behavior comes from `appsettings.json`. The loop code is untouched.
 
-**UserPromptSubmit**, triggers after user input, before entering the LLM. CC can intercept or modify input; the teaching version only logs:
+**Four events** cover a complete agent cycle:
 
-```csharp
-void ContextInjectHook(string query)
-{
-    Console.WriteLine($"\u001b[90m[HOOK] UserPromptSubmit: working in {workDir}\u001b[0m");
-}
+| Event | Trigger | stdin payload | Typical use |
+|-------|---------|---------------|-------------|
+| `UserPromptSubmit` | after user input, before LLM call | `{hookEventName, userPrompt}` | log, inject context |
+| `PreToolUse` | before tool execution | `{hookEventName, toolName, toolInput}` | permission checks, allow/deny lists |
+| `PostToolUse` | after tool execution | `{hookEventName, toolName, toolInput, toolOutput}` | audit, side effects, output checks |
+| `Stop` | before the loop exits | `{hookEventName, sessionStats:{toolCalls}}` | cleanup, write `session.json` |
 
-agent.Hooks.OnUserPromptSubmit(ContextInjectHook);
+**Protocol** (CC-compatible):
+
+| exit | meaning |
+|------|---------|
+| `0` | allow |
+| `2` | block; stderr (or stdout) becomes the reason |
+| other | non-blocking error; bus logs a warning, still allows |
+
+Optional stdout JSON overrides exit-code behavior:
+
+```jsonc
+{ "decision": "block", "reason": "..." }
 ```
 
-In the main loop, triggered right after user input:
+**Matcher syntax** (per group):
 
-```csharp
-var query = Console.ReadLine() ?? "";
-agent.FireUserPromptSubmit(query);    // ← before entering LLM
-history.Add(Message.UserText(query));
-await agent.RunUntilDoneAsync(history);
-```
+| pattern | matches |
+|---------|---------|
+| empty / `null` | every tool |
+| `"bash"` | exact |
+| `"bash*"` | prefix |
+| `"/regex/"` | regex (wrapped in `/.../`) |
 
-**PreToolUse / PostToolUse**, hooks before and after tool execution. s03's permission check logic is now wrapped as a PreToolUse hook, plus a logging hook and a large-output reminder:
-
-```csharp
-// PreToolUse: permission check (s03 logic, moved from loop to hook)
-string? PermissionHook(ToolUseBlock block)
-{
-    if (block.Name == "bash")
-    {
-        var cmd = block.Input.TryGetProperty("command", out var c) ? c.GetString() ?? "" : "";
-        foreach (var pattern in denyList)
-        {
-            if (cmd.Contains(pattern, StringComparison.Ordinal))
-                return "Permission denied by deny list";
-        }
-    }
-    if (block.Name is "write_file" or "edit_file"
-        && block.Input.TryGetProperty("path", out var p) && p.ValueKind == JsonValueKind.String)
-    {
-        try { _ = PathGuard.SafePath(workDir, p.GetString() ?? ""); }
-        catch
-        {
-            Console.Write("   Allow? [y/N] ");
-            var choice = (Console.ReadLine() ?? "").Trim().ToLowerInvariant();
-            if (choice is not ("y" or "yes")) return "Permission denied by user";
-        }
-    }
-    return null;
-}
-
-// PreToolUse: logging
-void LogHook(ToolUseBlock block)
-{
-    Console.WriteLine($"[HOOK] {block.Name}(...)");
-}
-
-// PostToolUse: large output reminder
-void LargeOutputHook(ToolUseBlock block, string output)
-{
-    if (output.Length > 100_000)
-        Console.WriteLine($"[HOOK] ⚠ Large output from {block.Name}");
-}
-
-agent.Hooks.OnPreToolUse(PermissionHook);
-agent.Hooks.OnPreToolUse(LogHook);
-agent.Hooks.OnPostToolUse(LargeOutputHook);
-```
-
-**Stop**, triggers when the loop is about to exit (`stop_reason != "tool_use"`). The teaching version prints a cleanup summary:
-
-```csharp
-string? SummaryHook(IReadOnlyList<Message>? messages)
-{
-    var toolCount = messages?
-        .SelectMany(m => m.Content)
-        .OfType<ToolResultBlock>()
-        .Count() ?? 0;
-    Console.WriteLine($"\u001b[90m[HOOK] Stop: session used {toolCount} tool calls\u001b[0m");
-    return null;   // return null = allow stop, return string = force continuation
-}
-
-agent.Hooks.OnStop(SummaryHook);
-```
-
-In agent_loop, triggered before exit:
-
-```csharp
-if (response.StopReason != "tool_use")
-{
-    var force = agent.Hooks.FireStopOnHistory(messages);   // ← before exiting
-    if (force is not null)
-    {
-        // hook returned a message → inject it and continue
-        messages.Add(Message.UserText(force));
-        continue;
-    }
-    return;
-}
-```
-
-**Only one change in the loop**: s03 directly called `check_permission(block)`, s04 replaces it with `trigger_hooks("PreToolUse", block)`:
-
-```csharp
-foreach (var block in response.Content.OfType<ToolUseBlock>())
-{
-    // s03: if (!CheckPermission(block)) { ... }
-    // s04: hooks replace hardcoding
-    var blocked = agent.Hooks.FirePreToolUse(block);
-    if (blocked is not null)
-    {
-        results.Add(new ToolResultBlock(block.Id, blocked));
-        continue;
-    }
-
-    var output = tools.Invoke(block.Name, block.Input);
-    agent.Hooks.FirePostToolUse(block, output);
-    results.Add(new ToolResultBlock(block.Id, output));
-}
-```
-
-Four hooks cover the critical nodes of the agent cycle: input → before execution → after execution → exit. The loop only calls trigger_hooks(); all logic lives in hook callbacks.
+**In `AgentCommon/Agent/AgentHarness.cs` only one line in the loop changes**: s03 called `check_permission(block)` directly; s04 calls `await Hooks.FirePreToolUseAsync(block, ct)`. Other fire points: `BeforeLlmCall` (top of `RunAsync`), `PostToolUse` (after tool execution), `FireStopOnHistory` (before the loop exits). External scripts and in-process delegates run side-by-side — the first block reason wins, and stderr flows into the model conversation.
 
 ---
 
@@ -199,12 +115,149 @@ Four hooks cover the critical nodes of the agent cycle: input → before executi
 
 | Component | Before (s03) | After (s04) |
 |-----------|-------------|-------------|
-| Extension method | check_permission() hardcoded in the loop | HOOKS registry + trigger_hooks() |
-| New functions | — | register_hook, trigger_hooks |
-| Hook callbacks | — | context_inject_hook, permission_hook, log_hook, large_output_hook, summary_hook |
-| Loop | Directly calls check_permission() | Calls trigger_hooks("PreToolUse", ...) |
-| Exit control | None | trigger_hooks("Stop", ...) can prevent exit |
-| Input interception | None | trigger_hooks("UserPromptSubmit", ...) can inject context |
+| Extension method | `check_permission()` hardcoded in the loop | `HookBus` + the `hooks` section of `appsettings.json` |
+| Where hooks are defined | Inline C# delegates | JSON config pointing at external JS/TS/any script |
+| When hooks are loaded | compile-time binding | dynamic, at startup via `ConfigureExternal` |
+| New types | — | `HooksConfig` / `HookGroup` / `HookCommand` / `ExternalHookEntry` / `ExternalHookRunner` / `ExternalHookLoader` |
+| Loop | Directly calls `check_permission()` | `await Hooks.FirePreToolUseAsync(block, ct)` |
+| Exit control | None | `FireStopOnHistoryAsync` can prevent exit |
+| Input interception | None | `FireUserPromptSubmitAsync` can inject context |
+| Protocol | — | CC-compatible: stdin = event JSON, exit 0/2 = allow/block |
+
+---
+
+## External hook scripts: JS / TS hang on too
+
+The hooks above are C# delegates (`OnPreToolUse(...)`, etc.). The real CC hook model goes further: it lets `settings.json` point an event at an **external command** — the command receives the event JSON on stdin and its exit code decides the outcome. Python CC treats the command as any executable (`.py`, `.sh`, `.ps1`, `.exe`…). The wider ecosystem (Cline, Roo, Continue) writes them in **JavaScript / TypeScript**, so this port makes JS/TS hooks first-class.
+
+### Wiring in `appsettings.json`
+
+```jsonc
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "bash",
+        "hooks": [ { "type": "command", "command": "node hooks/block-rm.js" } ] }
+    ],
+    "PostToolUse": [
+      { "hooks": [ { "type": "command", "command": "node hooks/audit-log.js" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "npx tsx hooks/summary.ts" } ] }
+    ]
+  }
+}
+```
+
+- `matcher` empty = match every tool; `"bash"` = exact; `"bash*"` = prefix; `"/regex/"` = regex.
+- `command` is split with a quote-aware tokenizer into **argv**, no shell.
+- The first token is the executable (`node` / `tsx` / `npx` / `py` / …), the rest are args. The runtime is the user's choice — we don't embed a JS engine.
+
+### Protocol: stdin / exit code / optional stdout
+
+The event is written to the script's stdin as JSON:
+
+| Event | JSON on stdin |
+|-------|---------------|
+| `PreToolUse` | `{ "hookEventName":"PreToolUse", "toolName":"bash", "toolInput":{ "command":"..." } }` |
+| `PostToolUse` | `{ "hookEventName":"PostToolUse", "toolName":"bash", "toolInput":{...}, "toolOutput":"..." }` |
+| `UserPromptSubmit` | `{ "hookEventName":"UserPromptSubmit", "userPrompt":"..." }` |
+| `Stop` | `{ "hookEventName":"Stop", "sessionStats":{ "toolCalls": 5 } }` |
+
+Exit code semantics (compatible with Python CC):
+
+| exit | meaning |
+|------|---------|
+| `0` | allow |
+| `2` | block; stderr (or stdout) becomes the reason |
+| other | non-blocking error; bus logs a warning and allows |
+
+An optional stdout JSON can override exit-code behavior:
+
+```jsonc
+// written to stdout
+{ "decision": "block", "reason": "rm -rf / is not allowed" }
+```
+
+For TypeScript, point the command at `npx tsx hooks/foo.ts`. The runtime is interchangeable — `node`, `bun`, `deno`, `tsx`, `ts-node` all work; swap the first token.
+
+### Full example: block `rm -rf`
+
+`hooks/block-rm.js`:
+
+```javascript
+const DENY = [/\brm\s+-rf?\s+\//, /\bsudo\b/, /\bshutdown\b|\breboot\b/, /\bmkfs\b/, /\bdd\s+if=/];
+
+(async () => {
+  const event = JSON.parse(await readStdin());
+  if (event.toolName !== "bash") process.exit(0);
+  const cmd = (event.toolInput && event.toolInput.command) || "";
+  for (const pat of DENY) {
+    if (pat.test(cmd)) {
+      console.error(`denied by ${pat}`);
+      process.exit(2);  // 2 = block, stderr becomes the reason
+    }
+  }
+  process.exit(0);
+})();
+```
+
+`appsettings.json`:
+
+```jsonc
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "bash",
+        "hooks": [ { "type": "command", "command": "node hooks/block-rm.js" } ] }
+    ]
+  }
+}
+```
+
+`s04_hooks/Program.cs` does one thing at startup — wire every external hook in one call:
+
+```csharp
+var n = agent.Hooks.ConfigureExternal(
+    config.Hooks, workDir,
+    log: msg => Console.Error.WriteLine(msg),
+    timeout: TimeSpan.FromSeconds(30));
+if (n > 0) Console.WriteLine($"[host] loaded {n} external hook(s) from appsettings.json");
+```
+
+`ConfigureExternal(config, workDir, log?, timeout?)` on the bus injects the `ExternalRunner`, sets `WorkDir`, and runs `ExternalHookLoader` to register every `command` declared under `hooks.<Event>[]` as an external subscriber. If `appsettings.json` has no `hooks` section it's a no-op and returns 0. Call it once during startup; in-process delegates and external scripts then run side-by-side, and the first rejection wins.
+
+### Out of scope (teaching-version simplifications)
+
+- **Embedded V8/Jint** — would pull a heavy dependency; TS would need an in-process transpiler.
+- **CSX (Roslyn scripting)** — C#-only, doesn't match the JS/TS-first AI-tool ecosystem.
+- **Process sandboxing** — timeout defaults to 30s (configurable); no cgroup/AppContainer isolation.
+- **Allow vs deny/ask priority** — this port has no settings.json layer, so we don't reproduce CC `toolHooks.ts:325-331`'s priority merge.
+
+---
+
+## Shipped scripts: make the example runnable
+
+`hooks/` ships seven example scripts. Copy `appsettings.example.json` → `appsettings.json` and they're all wired up. **The teaching version uses this "everything-from-config" shape** — `Program.cs` has zero `OnXxx` calls.
+
+| script | event | matcher | behavior |
+|--------|-------|---------|----------|
+| `block-rm.js` | PreToolUse | `bash` | deny list: blocks `rm -rf /`, `sudo`, `shutdown`, `reboot`, `mkfs`, `dd if=` |
+| `path-guard.js` | PreToolUse | `write_file\|edit_file` | rejects writes outside cwd (exit 2) |
+| `log-pretool.js` | PreToolUse | *all* | prints `toolName(key=val, …)` to stderr |
+| `log-prompt.js` | UserPromptSubmit | — | prints `cwd=` and the prompt (truncated 60 chars) to stderr |
+| `large-output.js` | PostToolUse | *all* | warns when tool output > 100_000 chars |
+| `audit-log.js` | PostToolUse | *all* | appends one JSONL line per tool call to `.memory/audit.log` |
+| `summary.ts` | Stop | — | writes `.memory/session.json` (requires `npx tsx`) |
+
+Each script is independently runnable for unit testing:
+
+```sh
+echo '{"hookEventName":"PreToolUse","toolName":"bash","toolInput":{"command":"sudo apt update"}}' | node hooks/block-rm.js
+# → exit 2, stderr: "block-rm: denied by pattern /\bsudo\b/"
+```
+
+To disable a category, comment out the matching block in `appsettings.json`; to swap an implementation, point the `command` at your own script. The loop code doesn't change.
 
 ---
 
@@ -220,8 +273,9 @@ Try these prompts:
 1. `Read the file README.md` (should pass directly, observe hook logs)
 2. `Create a file called test.txt` (after creation, observe if PostToolUse fires)
 3. `Delete all temporary files in /tmp` (bash + rm triggers permission hook)
+4. `Write something to ../../../etc/passwd` (path-guard rejects, exit 2)
 
-What to watch for: Before each tool execution, does the `[HOOK]` log appear? When permission is denied, was it intercepted by a hook or hardcoded in the loop?
+What to watch for: before each tool execution, does the `[HOOK]` log appear? When permission is denied, was it intercepted by `block-rm.js` / `path-guard.js`, or hardcoded in the loop? — The answer should be the former: s04's `Program.cs` contains zero permission-related code.
 
 ---
 
@@ -291,4 +345,4 @@ When PostToolUse hooks return `preventContinuation: true`, a `hook_stopped_conti
 
 </details>
 
-<!-- translation-sync: zh@v1, en@v1, ja@v1 -->
+<!-- translation-sync: zh@v1, en@v1, ja@v0 -->

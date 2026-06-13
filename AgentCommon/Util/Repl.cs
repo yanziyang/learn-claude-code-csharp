@@ -29,7 +29,7 @@ public static class Repl
             {
                 break;
             }
-            agent.FireUserPromptSubmit(trimmed);
+            await agent.FireUserPromptSubmitAsync(trimmed, ct);
             history.Add(Message.UserText(trimmed));
             await agent.RunUntilDoneAsync(history, maxIterations, ct);
             // Print final assistant text

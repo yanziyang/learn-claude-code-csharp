@@ -38,6 +38,7 @@ public sealed class AgentHarness
     public HookBus Hooks { get; } = new();
     public Action<string>? OnLog { get; set; }
     public int? MaxTokensEscalation { get; set; }
+    public string WorkDir { get; set; } = Directory.GetCurrentDirectory();
 
     public AgentHarness(DeepSeekClient client, ToolRegistry tools, string systemPrompt)
     {
@@ -59,7 +60,7 @@ public sealed class AgentHarness
         string? modelOverride = null,
         CancellationToken ct = default)
     {
-        Hooks.FireBeforeLlmCall(messages);
+        await Hooks.FireBeforeLlmCallAsync(messages, ct);
         Compactor.PrepareBeforeLlm(messages);
 
         var systemPrompt = SystemPromptProvider?.Invoke() ?? "";
@@ -101,7 +102,7 @@ public sealed class AgentHarness
             OnLog?.Invoke($"\u001b[33m> {block.Name}\u001b[0m");
 
             // Hooks first; any non-null return from PreToolUse blocks execution
-            var blocked = Hooks.FirePreToolUse(block);
+            var blocked = await Hooks.FirePreToolUseAsync(block, ct);
             string output;
             if (blocked is not null)
             {
@@ -119,7 +120,7 @@ public sealed class AgentHarness
                 };
             }
 
-            Hooks.FirePostToolUse(block, output);
+            await Hooks.FirePostToolUseAsync(block, output, ct);
             OnLog?.Invoke(output.Length > 200 ? output[..200] : output);
             results.Add(new ToolResultBlock(block.Id, output));
         }
@@ -158,7 +159,7 @@ public sealed class AgentHarness
             var resp = await RunAsync(messages, maxTokensOverride: overrideTokens, ct: ct);
 
             // Stop hook can request continuation
-            var force = Hooks.FireStopOnHistory(messages);
+            var force = await Hooks.FireStopOnHistoryAsync(messages, ct);
             if (force is not null)
             {
                 messages.Add(Message.UserText(force));
@@ -185,5 +186,6 @@ public sealed class AgentHarness
     /// Run a single turn — the UserPromptSubmit hooks fire here, then exactly one
     /// LLM call. Used by the REPL when the user submits a new prompt.
     /// </summary>
-    public void FireUserPromptSubmit(string query) => Hooks.FireUserPromptSubmit(query);
+    public Task FireUserPromptSubmitAsync(string query, CancellationToken ct = default) =>
+        Hooks.FireUserPromptSubmitAsync(query, ct);
 }

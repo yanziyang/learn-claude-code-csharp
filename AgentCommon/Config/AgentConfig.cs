@@ -25,6 +25,9 @@ public sealed class AgentConfig
     [JsonPropertyName("fallbackModel")]
     public string? FallbackModel { get; set; }
 
+    [JsonPropertyName("hooks")]
+    public HooksConfig? Hooks { get; set; }
+
     public string ResolveApiKey()
     {
         if (!string.IsNullOrWhiteSpace(ApiKey) && ApiKey != "PUT-YOUR-KEY-HERE")
