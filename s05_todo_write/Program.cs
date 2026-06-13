@@ -17,6 +17,9 @@ using AgentCommon.Messages;
 using AgentCommon.Tools;
 using AgentCommon.Util;
 
+HostEnvironment.Initialize();
+Console.WriteLine($"[host] {HostEnvironment.OsName} ({HostEnvironment.Shell})");
+
 var config = AgentConfigLoader.Load();
 var client = new DeepSeekClient(config);
 var tools = new ToolRegistry();
@@ -27,7 +30,8 @@ FileTools.Register(tools, workDir);                   // from s02
 var todos = new TodoTools.TodoState();
 TodoTools.Register(tools, todos);                     // NEW in s05
 
-var system = $"You are a coding agent at {workDir}. Use tools to solve tasks. Act, don't explain.";
+var system = $"You are a coding agent at {workDir}. Use tools to solve tasks. Act, don't explain.\n\n" +
+             HostEnvironment.PromptFragment;
 var agent = new AgentHarness(client, tools, system)
 {
     OnLog = Console.WriteLine,

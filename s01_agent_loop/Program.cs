@@ -27,6 +27,9 @@ using AgentCommon.Llm;
 using AgentCommon.Tools;
 using AgentCommon.Util;
 
+HostEnvironment.Initialize();
+Console.WriteLine($"[host] {HostEnvironment.OsName} ({HostEnvironment.Shell})");
+
 var config = AgentConfigLoader.Load();
 var client = new DeepSeekClient(config);
 var tools = new ToolRegistry();
@@ -36,7 +39,8 @@ BashTool.Register(tools, workDir);  // ← the only tool the agent has in s01
 
 // ── The core pattern: a while loop that calls tools until the model stops ──
 //    (the loop itself lives in AgentHarness.RunUntilDoneAsync)
-var system = $"You are a coding agent at {workDir}. Use bash to solve tasks. Act, don't explain.";
+var system = $"You are a coding agent at {workDir}. Use bash to solve tasks. Act, don't explain.\n\n" +
+             HostEnvironment.PromptFragment;
 var agent = new AgentHarness(client, tools, system)
 {
     OnLog = Console.WriteLine,

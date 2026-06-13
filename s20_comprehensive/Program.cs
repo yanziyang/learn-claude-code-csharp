@@ -43,6 +43,9 @@ using AgentCommon.Teams;
 using AgentCommon.Tools;
 using AgentCommon.Util;
 
+HostEnvironment.Initialize();
+Console.WriteLine($"[host] {HostEnvironment.OsName} ({HostEnvironment.Shell})");
+
 var config = AgentConfigLoader.Load();
 var client = new DeepSeekClient(config);
 client.AttachRetryPolicy(new RetryPolicy
@@ -78,7 +81,9 @@ var subTools = new ToolRegistry();
 BashTool.Register(subTools, workDir, onLog: msg => Console.WriteLine(msg));
 FileTools.Register(subTools, workDir);
 SubagentRunner SpawnSub() => new(
-    client, config, subTools, $"You are a focused sub-agent. Return a concise summary.",
+    client, config, subTools,
+    $"You are a focused sub-agent on {HostEnvironment.OsName} ({HostEnvironment.Shell}). " +
+    "Return a concise summary.\n\n" + HostEnvironment.PromptFragment,
     msg => Console.WriteLine(msg));
 TaskTool.Register(tools, SpawnSub);
 
@@ -114,6 +119,7 @@ var sections = new Dictionary<string, string>
     ["tools"] = "Available tools: bash, read_file, write_file, edit_file, glob, todo_write, task, load_skill, create_task/list_tasks/claim_task/complete_task, schedule_cron/list_crons/cancel_cron, spawn_teammate/send_message/check_inbox, mcp__docs__search.",
     ["workspace"] = $"Working directory: {workDir}",
     ["memory"] = "Relevant memories are injected below when available.",
+    ["environment"] = HostEnvironment.PromptFragment,
 };
 var ctx = new Dictionary<string, object>
 {
@@ -166,7 +172,7 @@ await Repl.RunAsync(agent, "\u001b[36ms20 >> \u001b[0m");
 
 static string Assemble(Dictionary<string, string> sections, Dictionary<string, object> ctx)
 {
-    var parts = new List<string> { sections["identity"], sections["tools"], sections["workspace"] };
+    var parts = new List<string> { sections["identity"], sections["tools"], sections["workspace"], sections["environment"] };
     if (ctx.TryGetValue("memories", out var m) && m is string ms && !string.IsNullOrEmpty(ms))
         parts.Add($"Relevant memories:\n{ms}");
     return string.Join("\n\n", parts);

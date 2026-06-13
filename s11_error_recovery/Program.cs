@@ -25,6 +25,9 @@ using AgentCommon.Llm;
 using AgentCommon.Tools;
 using AgentCommon.Util;
 
+HostEnvironment.Initialize();
+Console.WriteLine($"[host] {HostEnvironment.OsName} ({HostEnvironment.Shell})");
+
 var config = AgentConfigLoader.Load();
 var client = new DeepSeekClient(config);
 
@@ -45,7 +48,8 @@ FileTools.Register(tools, workDir);
 
 var compactor = new ContextCompactor(client, config, workDir, msg => Console.WriteLine(msg));
 
-var system = $"You are a coding agent at {workDir}. Use tools to solve tasks. Act, don't explain.";
+var system = $"You are a coding agent at {workDir}. Use tools to solve tasks. Act, don't explain.\n\n" +
+             HostEnvironment.PromptFragment;
 var agent = new AgentHarness(client, tools, system)
 {
     OnLog = Console.WriteLine,

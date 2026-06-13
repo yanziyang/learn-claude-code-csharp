@@ -25,6 +25,9 @@ using AgentCommon.Teams;
 using AgentCommon.Tools;
 using AgentCommon.Util;
 
+HostEnvironment.Initialize();
+Console.WriteLine($"[host] {HostEnvironment.OsName} ({HostEnvironment.Shell})");
+
 var config = AgentConfigLoader.Load();
 var client = new DeepSeekClient(config);
 
@@ -96,7 +99,8 @@ Console.WriteLine($"\u001b[36m[s19] tool pool assembled: {pool.All().Count()} to
 
 var compactor = new ContextCompactor(client, config, workDir, msg => Console.WriteLine(msg));
 var system = $"You are a coding agent at {workDir}. " +
-             $"Available tools: {string.Join(", ", pool.All().Select(t => t.Name))}.";
+             $"Available tools: {string.Join(", ", pool.All().Select(t => t.Name))}.\n\n" +
+             HostEnvironment.PromptFragment;
 var agent = new AgentHarness(client, pool, system)
 {
     OnLog = Console.WriteLine,

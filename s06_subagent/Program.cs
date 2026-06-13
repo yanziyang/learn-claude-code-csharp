@@ -14,6 +14,9 @@ using AgentCommon.Subagent;
 using AgentCommon.Tools;
 using AgentCommon.Util;
 
+HostEnvironment.Initialize();
+Console.WriteLine($"[host] {HostEnvironment.OsName} ({HostEnvironment.Shell})");
+
 var config = AgentConfigLoader.Load();
 var client = new DeepSeekClient(config);
 
@@ -35,14 +38,17 @@ FileTools.Register(subTools, workDir);
 //    shared loop with the sub-tool set and a sub-system prompt. ──
 SubagentRunner SpawnSub() => new(
     client, config, subTools,
-    $"You are a focused sub-agent at {workDir}. Complete the given task and return a concise final answer.",
+    $"You are a focused sub-agent at {workDir} on {HostEnvironment.OsName} ({HostEnvironment.Shell}). " +
+    "Complete the given task and return a concise final answer.\n\n" +
+    HostEnvironment.PromptFragment,
     msg => Console.WriteLine(msg));
 
 // Register `task` tool on the parent
 TaskTool.Register(parentTools, SpawnSub);
 
 var system = $"You are a coding agent at {workDir}. Use tools to solve tasks. Act, don't explain. " +
-             "Delegate focused subtasks via the `task` tool.";
+             "Delegate focused subtasks via the `task` tool.\n\n" +
+             HostEnvironment.PromptFragment;
 var agent = new AgentHarness(client, parentTools, system)
 {
     OnLog = Console.WriteLine,

@@ -29,6 +29,9 @@ using AgentCommon.Teams;
 using AgentCommon.Tools;
 using AgentCommon.Util;
 
+HostEnvironment.Initialize();
+Console.WriteLine($"[host] {HostEnvironment.OsName} ({HostEnvironment.Shell})");
+
 var config = AgentConfigLoader.Load();
 var client = new DeepSeekClient(config);
 
@@ -82,7 +85,8 @@ tools.Register("request_plan", "Ask a teammate to submit a plan.",
 
 var compactor = new ContextCompactor(client, config, workDir, msg => Console.WriteLine(msg));
 var system = $"You are the lead coding agent at {workDir}. " +
-             "Use spawn_teammate, send_message, check_inbox, request_shutdown, request_plan.";
+             "Use spawn_teammate, send_message, check_inbox, request_shutdown, request_plan.\n\n" +
+             HostEnvironment.PromptFragment;
 var agent = new AgentHarness(client, tools, system)
 {
     OnLog = Console.WriteLine,

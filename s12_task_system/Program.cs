@@ -18,6 +18,9 @@ using AgentCommon.Tasks;
 using AgentCommon.Tools;
 using AgentCommon.Util;
 
+HostEnvironment.Initialize();
+Console.WriteLine($"[host] {HostEnvironment.OsName} ({HostEnvironment.Shell})");
+
 var config = AgentConfigLoader.Load();
 var client = new DeepSeekClient(config);
 
@@ -31,7 +34,8 @@ TaskTools.Register(tools, store, msg => Console.WriteLine(msg));   // NEW in s12
 
 var compactor = new ContextCompactor(client, config, workDir, msg => Console.WriteLine(msg));
 var system = $"You are a coding agent at {workDir}. " +
-             "Plan work with create_task, claim_task, complete_task.";
+             "Plan work with create_task, claim_task, complete_task.\n\n" +
+             HostEnvironment.PromptFragment;
 var agent = new AgentHarness(client, tools, system)
 {
     OnLog = Console.WriteLine,

@@ -20,6 +20,9 @@ using AgentCommon.Permissions;
 using AgentCommon.Tools;
 using AgentCommon.Util;
 
+HostEnvironment.Initialize();
+Console.WriteLine($"[host] {HostEnvironment.OsName} ({HostEnvironment.Shell})");
+
 var config = AgentConfigLoader.Load();
 var client = new DeepSeekClient(config);
 var tools = new ToolRegistry();
@@ -67,7 +70,8 @@ var rules = new List<PermissionRule>
     },
 };
 
-var system = $"You are a coding agent at {workDir}. All destructive operations require user approval.";
+var system = $"You are a coding agent at {workDir}. All destructive operations require user approval.\n\n" +
+             HostEnvironment.PromptFragment;
 var agent = new AgentHarness(client, tools, system)
 {
     OnLog = Console.WriteLine,

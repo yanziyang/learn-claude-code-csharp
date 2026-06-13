@@ -30,6 +30,9 @@ using AgentCommon.Teams;
 using AgentCommon.Tools;
 using AgentCommon.Util;
 
+HostEnvironment.Initialize();
+Console.WriteLine($"[host] {HostEnvironment.OsName} ({HostEnvironment.Shell})");
+
 var config = AgentConfigLoader.Load();
 var client = new DeepSeekClient(config);
 
@@ -166,7 +169,8 @@ scout.Start();
 
 var compactor = new ContextCompactor(client, config, workDir, msg => Console.WriteLine(msg));
 var system = $"You are the lead coding agent at {workDir}. " +
-             "Create tasks; the scout will create a worktree and spawn a worker for each.";
+             "Create tasks; the scout will create a worktree and spawn a worker for each.\n\n" +
+             HostEnvironment.PromptFragment;
 var agent = new AgentHarness(client, tools, system)
 {
     OnLog = Console.WriteLine,

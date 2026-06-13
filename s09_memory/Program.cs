@@ -25,6 +25,9 @@ using AgentCommon.Subagent;
 using AgentCommon.Tools;
 using AgentCommon.Util;
 
+HostEnvironment.Initialize();
+Console.WriteLine($"[host] {HostEnvironment.OsName} ({HostEnvironment.Shell})");
+
 var config = AgentConfigLoader.Load();
 var client = new DeepSeekClient(config);
 
@@ -45,7 +48,9 @@ FileTools.Register(subTools, workDir);
 
 SubagentRunner SpawnSub() => new(
     client, config, subTools,
-    $"You are a focused sub-agent at {workDir}. Complete the given task and return a concise final answer.",
+    $"You are a focused sub-agent at {workDir} on {HostEnvironment.OsName} ({HostEnvironment.Shell}). " +
+    "Complete the given task and return a concise final answer.\n\n" +
+    HostEnvironment.PromptFragment,
     msg => Console.WriteLine(msg));
 TaskTool.Register(parentTools, SpawnSub);
 
@@ -58,7 +63,8 @@ var system =
     $"You are a coding agent at {workDir}.\n\n" +
     "Memories available:\n" + (string.IsNullOrEmpty(store.IndexText()) ? "(none yet)" : store.IndexText()) + "\n\n" +
     "Relevant memories are injected below. Respect user preferences from memory.\n" +
-    "When the user says 'remember' or expresses a clear preference, extract it as a memory.";
+    "When the user says 'remember' or expresses a clear preference, extract it as a memory.\n\n" +
+    HostEnvironment.PromptFragment;
 
 var compactor = new ContextCompactor(client, config, workDir, msg => Console.WriteLine(msg));
 var agent = new AgentHarness(client, parentTools, system)

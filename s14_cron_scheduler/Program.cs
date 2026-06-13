@@ -23,6 +23,9 @@ using AgentCommon.Tasks;
 using AgentCommon.Tools;
 using AgentCommon.Util;
 
+HostEnvironment.Initialize();
+Console.WriteLine($"[host] {HostEnvironment.OsName} ({HostEnvironment.Shell})");
+
 var config = AgentConfigLoader.Load();
 var client = new DeepSeekClient(config);
 
@@ -42,7 +45,8 @@ CronTools.Register(tools, cron);
 var compactor = new ContextCompactor(client, config, workDir, msg => Console.WriteLine(msg));
 var system = $"You are a coding agent at {workDir}. " +
              "Tools: bash, read_file, write_file, task system, " +
-             "schedule_cron, list_crons, cancel_cron.";
+             "schedule_cron, list_crons, cancel_cron.\n\n" +
+             HostEnvironment.PromptFragment;
 var agent = new AgentHarness(client, tools, system)
 {
     OnLog = Console.WriteLine,

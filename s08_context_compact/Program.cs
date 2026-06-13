@@ -26,6 +26,9 @@ using AgentCommon.Subagent;
 using AgentCommon.Tools;
 using AgentCommon.Util;
 
+HostEnvironment.Initialize();
+Console.WriteLine($"[host] {HostEnvironment.OsName} ({HostEnvironment.Shell})");
+
 var config = AgentConfigLoader.Load();
 var client = new DeepSeekClient(config);
 
@@ -46,14 +49,17 @@ FileTools.Register(subTools, workDir);
 
 SubagentRunner SpawnSub() => new(
     client, config, subTools,
-    $"You are a focused sub-agent at {workDir}. Complete the given task and return a concise final answer.",
+    $"You are a focused sub-agent at {workDir} on {HostEnvironment.OsName} ({HostEnvironment.Shell}). " +
+    "Complete the given task and return a concise final answer.\n\n" +
+    HostEnvironment.PromptFragment,
     msg => Console.WriteLine(msg));
 TaskTool.Register(parentTools, SpawnSub);
 
 var system =
     $"You are a coding agent at {workDir}. " +
     "Skills available:\n" + skills.Catalog() + "\n" +
-    "Use load_skill to get full details when needed.";
+    "Use load_skill to get full details when needed.\n\n" +
+    HostEnvironment.PromptFragment;
 
 // NEW in s08: the four-layer compactor
 var compactor = new ContextCompactor(client, config, workDir, msg => Console.WriteLine(msg));

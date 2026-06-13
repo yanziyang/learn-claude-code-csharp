@@ -22,6 +22,9 @@ using AgentCommon.Memory;
 using AgentCommon.Tools;
 using AgentCommon.Util;
 
+HostEnvironment.Initialize();
+Console.WriteLine($"[host] {HostEnvironment.OsName} ({HostEnvironment.Shell})");
+
 var config = AgentConfigLoader.Load();
 var client = new DeepSeekClient(config);
 
@@ -40,11 +43,12 @@ var sections = new Dictionary<string, string>
     ["tools"] = "Available tools: bash, read_file, write_file, edit_file, glob.",
     ["workspace"] = $"Working directory: {workDir}",
     ["memory"] = "Relevant memories are injected below when available.",
+    ["environment"] = HostEnvironment.PromptFragment,
 };
 
 var assemble = (Dictionary<string, object> ctx) =>
 {
-    var parts = new List<string> { sections["identity"], sections["tools"], sections["workspace"] };
+    var parts = new List<string> { sections["identity"], sections["tools"], sections["workspace"], sections["environment"] };
     if (ctx.TryGetValue("memories", out var m) && m is string ms && !string.IsNullOrEmpty(ms))
     {
         parts.Add($"Relevant memories:\n{ms}");
@@ -67,7 +71,7 @@ var getPrompt = (Dictionary<string, object> ctx) =>
     }
     lastKey = key;
     lastPrompt = assemble(ctx);
-    var loaded = new List<string> { "identity", "tools", "workspace" };
+    var loaded = new List<string> { "identity", "tools", "workspace", "environment" };
     if (ctx.TryGetValue("memories", out var m) && m is string ms && !string.IsNullOrEmpty(ms))
     {
         loaded.Add("memory");
