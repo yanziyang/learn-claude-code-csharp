@@ -9,6 +9,15 @@ interface SourceViewerProps {
 
 function highlightLine(line: string): React.ReactNode[] {
   const trimmed = line.trimStart();
+  // C# / .NET line comments.
+  if (trimmed.startsWith("//")) {
+    return [
+      <span key={0} className="text-zinc-400 italic">
+        {line}
+      </span>,
+    ];
+  }
+  // Python line comments (legacy code.py source).
   if (trimmed.startsWith("#")) {
     return [
       <span key={0} className="text-zinc-400 italic">
@@ -32,14 +41,28 @@ function highlightLine(line: string): React.ReactNode[] {
   }
 
   const keywordSet = new Set([
-    "def", "class", "import", "from", "return", "if", "elif", "else",
-    "while", "for", "in", "not", "and", "or", "is", "None", "True",
-    "False", "try", "except", "raise", "with", "as", "yield", "break",
-    "continue", "pass", "global", "lambda", "async", "await",
+    // C# keywords
+    "abstract", "as", "base", "bool", "break", "byte", "case", "catch",
+    "char", "checked", "class", "const", "continue", "decimal", "default",
+    "delegate", "do", "double", "else", "enum", "event", "explicit",
+    "extern", "false", "finally", "fixed", "float", "for", "foreach",
+    "goto", "if", "implicit", "in", "int", "interface", "internal", "is",
+    "lock", "long", "namespace", "new", "null", "object", "operator",
+    "out", "override", "params", "private", "protected", "public",
+    "readonly", "ref", "return", "sbyte", "sealed", "short", "sizeof",
+    "stackalloc", "static", "string", "struct", "switch", "this", "throw",
+    "true", "try", "typeof", "uint", "ulong", "unchecked", "unsafe",
+    "ushort", "using", "var", "virtual", "void", "volatile", "where",
+    "while", "yield", "async", "await", "record", "init", "required",
+    "file", "global", "nameof",
+    // Python keywords (legacy)
+    "def", "import", "from", "elif", "not", "and", "or", "None",
+    "True", "False", "except", "raise", "with", "as", "pass", "global",
+    "lambda", "self",
   ]);
 
   const parts = line.split(
-    /(\b(?:def|class|import|from|return|if|elif|else|while|for|in|not|and|or|is|None|True|False|try|except|raise|with|as|yield|break|continue|pass|global|lambda|async|await|self)\b|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|f"(?:[^"\\]|\\.)*"|f'(?:[^'\\]|\\.)*'|#.*$|\b\d+(?:\.\d+)?\b)/
+    /(\b(?:abstract|as|base|bool|break|byte|case|catch|char|checked|class|const|continue|decimal|default|delegate|do|double|else|enum|event|explicit|extern|false|finally|fixed|float|for|foreach|goto|if|implicit|in|int|interface|internal|is|lock|long|namespace|new|null|object|operator|out|override|params|private|protected|public|readonly|ref|return|sbyte|sealed|short|sizeof|stackalloc|static|string|struct|switch|this|throw|true|try|typeof|uint|ulong|unchecked|unsafe|ushort|using|var|virtual|void|volatile|where|while|yield|async|await|record|init|required|file|global|nameof|def|import|from|elif|not|and|or|None|True|False|except|raise|with|as|pass|global|lambda|self|self)\b|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|f"(?:[^"\\]|\\.)*"|f'(?:[^'\\]|\\.)*'|@"[^"]*"|\$"(?:[^"]|\\.)*"|\/\/.*$|#.*$|\b\d+(?:\.\d+)?\b)/
   );
 
   return parts.map((part, idx) => {
@@ -47,17 +70,19 @@ function highlightLine(line: string): React.ReactNode[] {
     if (keywordSet.has(part)) {
       return <span key={idx} className="text-blue-400 font-medium">{part}</span>;
     }
-    if (part === "self") {
+    if (part === "self" || part === "this") {
       return <span key={idx} className="text-purple-400">{part}</span>;
     }
-    if (part.startsWith("#")) {
+    if (part.startsWith("//") || part.startsWith("#")) {
       return <span key={idx} className="text-zinc-400 italic">{part}</span>;
     }
     if (
       (part.startsWith('"') && part.endsWith('"')) ||
       (part.startsWith("'") && part.endsWith("'")) ||
       (part.startsWith('f"') && part.endsWith('"')) ||
-      (part.startsWith("f'") && part.endsWith("'"))
+      (part.startsWith("f'") && part.endsWith("'")) ||
+      (part.startsWith('@"') && part.endsWith('"')) ||
+      (part.startsWith('$"') && part.endsWith('"'))
     ) {
       return <span key={idx} className="text-emerald-500">{part}</span>;
     }

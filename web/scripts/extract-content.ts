@@ -13,17 +13,25 @@ const WEB_DIR = path.resolve(__dirname, "..");
 const REPO_ROOT = path.resolve(WEB_DIR, "..");
 const LEGACY_AGENTS_DIR = path.join(REPO_ROOT, "agents");
 const LEGACY_DOCS_DIR = path.join(REPO_ROOT, "docs");
+const AGENT_COMMON_DIR = path.join(REPO_ROOT, "AgentCommon");
 const OUT_DIR = path.join(WEB_DIR, "src", "data", "generated");
 const PUBLIC_DIR = path.join(WEB_DIR, "public");
 const COURSE_ASSETS_DIR = path.join(PUBLIC_DIR, "course-assets");
 
 type Locale = "en" | "zh" | "ja";
+type Language = "csharp" | "python";
+
+interface CodeFile {
+  absPath: string;
+  relativePath: string;
+  language: Language;
+}
 
 interface ChapterSource {
   id: string;
   dirName: string;
   dirPath: string;
-  codePath: string;
+  code: CodeFile | null;
 }
 
 function dirToVersionId(dirName: string): string | null {
@@ -39,6 +47,20 @@ function filenameToVersionId(filename: string): string | null {
   return match ? match[1] : null;
 }
 
+function findCodeFile(dirPath: string): CodeFile | null {
+  const candidates: { file: string; language: Language }[] = [
+    { file: "Program.cs", language: "csharp" },
+    { file: "code.py", language: "python" },
+  ];
+  for (const c of candidates) {
+    const abs = path.join(dirPath, c.file);
+    if (fs.existsSync(abs)) {
+      return { absPath: abs, relativePath: c.file, language: c.language };
+    }
+  }
+  return null;
+}
+
 function listRootChapters(): ChapterSource[] {
   return fs
     .readdirSync(REPO_ROOT, { withFileTypes: true })
@@ -50,78 +72,256 @@ function listRootChapters(): ChapterSource[] {
       const id = dirToVersionId(dirName);
       if (!id) return null;
       const dirPath = path.join(REPO_ROOT, dirName);
-      const codePath = path.join(dirPath, "code.py");
-      if (!fs.existsSync(codePath)) return null;
-      return { id, dirName, dirPath, codePath };
+      return { id, dirName, dirPath, code: findCodeFile(dirPath) };
     })
     .filter((chapter): chapter is ChapterSource => chapter !== null);
 }
 
+function walkCsFiles(dir: string): string[] {
+  const out: string[] = [];
+  if (!fs.existsSync(dir)) return out;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const p = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      out.push(...walkCsFiles(p));
+    } else if (entry.isFile() && p.endsWith(".cs")) {
+      out.push(p);
+    }
+  }
+  return out;
+}
+
 function extractClasses(
-  lines: string[]
+  lines: string[],
+  language: Language
 ): { name: string; startLine: number; endLine: number }[] {
   const classes: { name: string; startLine: number; endLine: number }[] = [];
-  const classPattern = /^class\s+(\w+)/;
+  if (language === "python") {
+    const classPattern = /^class\s+(\w+)/;
+    for (let i = 0; i < lines.length; i++) {
+      const match = lines[i].match(classPattern);
+      if (!match) continue;
+      const name = match[1];
+      const startLine = i + 1;
+      let endLine = lines.length;
+      for (let j = i + 1; j < lines.length; j++) {
+        if (
+          lines[j].match(/^class\s/) ||
+          lines[j].match(/^def\s/) ||
+          (lines[j].match(/^\S/) &&
+            lines[j].trim() !== "" &&
+            !lines[j].startsWith("#") &&
+            !lines[j].startsWith("@"))
+        ) {
+          endLine = j;
+          break;
+        }
+      }
+      classes.push({ name, startLine, endLine });
+    }
+    return classes;
+  }
 
+  // C#: class | record | struct | interface | enum, with optional modifiers.
+  const classPattern =
+    /^\s*(?:public|internal|private|protected|file|static|sealed|abstract|partial|new|virtual|override|unsafe|readonly|ref|sealed\s+record|\s+)*\b(?:class|record|struct|interface|enum)\s+(\w+)/;
   for (let i = 0; i < lines.length; i++) {
     const match = lines[i].match(classPattern);
     if (!match) continue;
-
     const name = match[1];
     const startLine = i + 1;
     let endLine = lines.length;
     for (let j = i + 1; j < lines.length; j++) {
-      if (
-        lines[j].match(/^class\s/) ||
-        lines[j].match(/^def\s/) ||
-        (lines[j].match(/^\S/) &&
-          lines[j].trim() !== "" &&
-          !lines[j].startsWith("#") &&
-          !lines[j].startsWith("@"))
-      ) {
+      if (classPattern.test(lines[j])) {
         endLine = j;
         break;
       }
     }
     classes.push({ name, startLine, endLine });
   }
-
   return classes;
 }
 
 function extractFunctions(
-  lines: string[]
+  lines: string[],
+  language: Language
 ): { name: string; signature: string; startLine: number }[] {
-  const functions: { name: string; signature: string; startLine: number }[] = [];
-  const funcPattern = /^def\s+(\w+)\((.*?)\)/;
-
-  for (let i = 0; i < lines.length; i++) {
-    const match = lines[i].match(funcPattern);
-    if (!match) continue;
-    functions.push({
-      name: match[1],
-      signature: `def ${match[1]}(${match[2]})`,
-      startLine: i + 1,
-    });
+  if (language === "python") {
+    const functions: { name: string; signature: string; startLine: number }[] = [];
+    const funcPattern = /^def\s+(\w+)\((.*?)\)/;
+    for (let i = 0; i < lines.length; i++) {
+      const match = lines[i].match(funcPattern);
+      if (!match) continue;
+      functions.push({
+        name: match[1],
+        signature: `def ${match[1]}(${match[2]})`,
+        startLine: i + 1,
+      });
+    }
+    return functions;
   }
 
+  // C#: scan lines for method-shaped declarations, with multi-line signature support.
+  const functions: { name: string; signature: string; startLine: number }[] = [];
+  const skip = new Set([
+    "if", "else", "for", "foreach", "while", "do", "switch", "try", "catch", "finally",
+    "using", "return", "throw", "yield", "new", "var", "namespace", "class", "struct",
+    "interface", "enum", "record", "public", "private", "internal", "protected", "static",
+    "sealed", "abstract", "partial", "override", "virtual", "async", "extern", "unsafe",
+    "readonly", "volatile", "fixed", "required", "file", "out", "ref", "in", "params",
+    "this", "typeof", "sizeof", "nameof", "is", "as", "default", "true", "false", "null",
+    "where", "get", "set", "init", "add", "remove", "case", "break", "continue",
+  ]);
+  // Lines that look like a method declaration must not start with these.
+  const statementPrefixes = [
+    "var ", "let ", "const ", "new ", "await ", "return ", "throw ", "yield ",
+    "= ", "+=", "-=", "*=", "/=", "?: ", "?.", "?.(",
+  ];
+
+  let i = 0;
+  while (i < lines.length) {
+    const trimmed = lines[i].trim();
+    if (
+      !trimmed ||
+      trimmed.startsWith("//") ||
+      trimmed.startsWith("/*") ||
+      trimmed.startsWith("*")
+    ) {
+      i++;
+      continue;
+    }
+
+    // Reject statement-style lines that merely contain a lambda.
+    if (statementPrefixes.some((p) => trimmed.startsWith(p))) {
+      i++;
+      continue;
+    }
+
+    const openParen = trimmed.indexOf("(");
+    if (openParen < 0) {
+      i++;
+      continue;
+    }
+
+    // Accumulate lines until the closing paren is found.
+    let combined = trimmed;
+    let j = i;
+    if (trimmed.indexOf(")", openParen) < 0) {
+      while (j + 1 < lines.length && combined.indexOf(")", openParen) < 0 && j - i < 6) {
+        j++;
+        combined += " " + lines[j].trim();
+      }
+    }
+
+    const closeParen = combined.indexOf(")", openParen);
+    if (closeParen < 0) {
+      i = Math.max(i + 1, j + 1);
+      continue;
+    }
+
+    const afterParen = combined.substring(closeParen + 1).trimStart();
+    let looksLikeMethod =
+      afterParen.startsWith("{") || /^=>/.test(afterParen) || /^\s*where\b/.test(afterParen);
+    // Multi-line signatures: `)` is the last thing on the line, the next
+    // non-blank line starts with `{` or `=>`.
+    if (!looksLikeMethod && afterParen === "" && j + 1 < lines.length) {
+      let k = j + 1;
+      while (k < lines.length && lines[k].trim() === "") k++;
+      if (k < lines.length) {
+        const next = lines[k].trim();
+        if (next.startsWith("{") || next.startsWith("=>") || /^\s*where\b/.test(next)) {
+          looksLikeMethod = true;
+        }
+      }
+    }
+    if (!looksLikeMethod) {
+      i = Math.max(i + 1, j + 1);
+      continue;
+    }
+
+    const before = combined.substring(0, openParen).trim();
+    // Skip when the name is preceded by `new ` (constructor call, e.g. `new Thread(...)`).
+    if (/\bnew\s+\w*$/.test(before)) {
+      i = Math.max(i + 1, j + 1);
+      continue;
+    }
+    // Strip trailing generic type arguments.
+    const beforeNoGeneric = before.replace(/<[^>]+>$/, "").trim();
+    const tokens = beforeNoGeneric.split(/\s+/);
+    const name = tokens[tokens.length - 1];
+    if (!name || !/^\w+$/.test(name)) {
+      i = Math.max(i + 1, j + 1);
+      continue;
+    }
+    if (skip.has(name)) {
+      i = Math.max(i + 1, j + 1);
+      continue;
+    }
+
+    const signature = combined
+      .split(/\s*\{/)[0]
+      .split(/\s*=>/)[0]
+      .trim();
+
+    functions.push({ name, signature, startLine: i + 1 });
+    i = Math.max(i + 1, j + 1);
+  }
   return functions;
 }
 
-function extractTools(source: string): string[] {
-  const toolPattern = /"name"\s*:\s*"([\w-]+)"/g;
+function extractTools(source: string, language: Language, classToolMap: Map<string, string[]>): string[] {
   const tools = new Set<string>();
-  let match;
-  while ((match = toolPattern.exec(source)) !== null) {
-    tools.add(match[1]);
+  if (language === "python") {
+    const toolPattern = /"name"\s*:\s*"([\w-]+)"/g;
+    let m: RegExpExecArray | null;
+    while ((m = toolPattern.exec(source)) !== null) {
+      tools.add(m[1]);
+    }
+    return Array.from(tools);
   }
+
+  // C#: collect tools from inline `tools.Register("name", ...)` calls
+  // and from static `XxxTool.Register(tools, ...)` calls resolved via classToolMap.
+  const inlinePattern = /tools\.Register\(\s*"([\w-]+)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = inlinePattern.exec(source)) !== null) {
+    tools.add(m[1]);
+  }
+
+  const staticPattern = /(\w+Tools?)\.Register\(\s*\w+/g;
+  while ((m = staticPattern.exec(source)) !== null) {
+    const className = m[1];
+    const names = classToolMap.get(className);
+    if (names) {
+      for (const n of names) tools.add(n);
+    }
+  }
+
   return Array.from(tools);
 }
 
-function countLoc(lines: string[]): number {
+function countLoc(lines: string[], language: Language): number {
+  let inBlockComment = false;
   return lines.filter((line) => {
     const trimmed = line.trim();
-    return trimmed !== "" && !trimmed.startsWith("#");
+    if (trimmed === "") return false;
+
+    if (language === "python") {
+      return !trimmed.startsWith("#");
+    }
+
+    // C#
+    if (inBlockComment) {
+      if (trimmed.includes("*/")) inBlockComment = false;
+      return false;
+    }
+    if (trimmed.startsWith("/*")) {
+      if (!trimmed.endsWith("*/") && !trimmed.includes("*/")) inBlockComment = true;
+      return false;
+    }
+    if (trimmed.startsWith("//")) return false;
+    if (trimmed.startsWith("*")) return false;
+    return true;
   }).length;
 }
 
@@ -206,24 +406,96 @@ function rewriteChapterMarkdown(
   return next;
 }
 
-function buildRootVersions(chapters: ChapterSource[]): AgentVersion[] {
-  return chapters.map((chapter) => {
-    const source = fs.readFileSync(chapter.codePath, "utf-8");
-    const lines = source.split("\n");
-    const meta = VERSION_META[chapter.id];
+function buildClassToolMap(): Map<string, string[]> {
+  // Walk AgentCommon/*.cs, track class scope, and capture every
+  // `tools.Register("name", ...)` call found inside each class body.
+  const map = new Map<string, string[]>();
+  const classPattern =
+    /^\s*(?:public|internal|private|protected|file|static|sealed|abstract|partial|new|virtual|override|unsafe|readonly|ref|\s+)*\bclass\s+(\w+)/;
+  const toolRegisterPattern = /tools\.Register\(\s*"([\w-]+)"/g;
 
+  for (const file of walkCsFiles(AGENT_COMMON_DIR)) {
+    const source = fs.readFileSync(file, "utf-8");
+    const lines = source.split("\n");
+    let currentClass: string | null = null;
+    let depth = 0;
+    let classDepth = -1;
+    let justEntered = false;
+
+    for (const line of lines) {
+      if (currentClass === null) {
+        const m = line.match(classPattern);
+        if (m) {
+          currentClass = m[1];
+          if (!map.has(currentClass)) map.set(currentClass, []);
+          classDepth = -1;
+          justEntered = true;
+        }
+      } else {
+        const re = new RegExp(toolRegisterPattern.source, "g");
+        let mm: RegExpExecArray | null;
+        while ((mm = re.exec(line)) !== null) {
+          const list = map.get(currentClass)!;
+          if (!list.includes(mm[1])) list.push(mm[1]);
+        }
+      }
+
+      for (const ch of line) {
+        if (ch === "{") depth++;
+        else if (ch === "}") depth--;
+      }
+
+      if (justEntered) {
+        justEntered = false;
+        classDepth = depth;
+      } else if (currentClass !== null && classDepth >= 0 && depth < classDepth) {
+        currentClass = null;
+        classDepth = -1;
+      }
+    }
+  }
+  return map;
+}
+
+function buildRootVersions(
+  chapters: ChapterSource[],
+  classToolMap: Map<string, string[]>
+): AgentVersion[] {
+  return chapters.map((chapter) => {
+    const meta = VERSION_META[chapter.id];
+    if (!chapter.code) {
+      return {
+        id: chapter.id,
+        filename: `${chapter.dirName}/README.md`,
+        title: meta?.title ?? chapter.id,
+        subtitle: meta?.subtitle ?? "",
+        loc: 0,
+        tools: [],
+        newTools: [],
+        coreAddition: meta?.coreAddition ?? "",
+        keyInsight: meta?.keyInsight ?? "",
+        classes: [],
+        functions: [],
+        layer: meta?.layer ?? "tools",
+        source: "",
+        images: copyChapterAssets(chapter),
+      };
+    }
+
+    const source = fs.readFileSync(chapter.code.absPath, "utf-8");
+    const lines = source.split("\n");
     return {
       id: chapter.id,
-      filename: `${chapter.dirName}/code.py`,
+      filename: `${chapter.dirName}/${chapter.code.relativePath}`,
       title: meta?.title ?? chapter.id,
       subtitle: meta?.subtitle ?? "",
-      loc: countLoc(lines),
-      tools: extractTools(source),
+      loc: countLoc(lines, chapter.code.language),
+      tools: extractTools(source, chapter.code.language, classToolMap),
       newTools: [] as string[],
       coreAddition: meta?.coreAddition ?? "",
       keyInsight: meta?.keyInsight ?? "",
-      classes: extractClasses(lines),
-      functions: extractFunctions(lines),
+      classes: extractClasses(lines, chapter.code.language),
+      functions: extractFunctions(lines, chapter.code.language),
       layer: meta?.layer ?? "tools",
       source,
       images: copyChapterAssets(chapter),
@@ -253,13 +525,13 @@ function buildLegacyVersions(): AgentVersion[] {
         filename,
         title: meta?.title ?? id,
         subtitle: meta?.subtitle ?? "",
-        loc: countLoc(lines),
-        tools: extractTools(source),
+        loc: countLoc(lines, "python"),
+        tools: extractTools(source, "python", new Map()),
         newTools: [] as string[],
         coreAddition: meta?.coreAddition ?? "",
         keyInsight: meta?.keyInsight ?? "",
-        classes: extractClasses(lines),
-        functions: extractFunctions(lines),
+        classes: extractClasses(lines, "python"),
+        functions: extractFunctions(lines, "python"),
         layer: meta?.layer ?? "tools",
         source,
         images: [] as ChapterImage[],
@@ -384,8 +656,15 @@ function main() {
       : "  Source: legacy agents/docs folders"
   );
 
+  const classToolMap = useRootTrack ? buildClassToolMap() : new Map<string, string[]>();
+  console.log(
+    useRootTrack
+      ? `  Built class→tool map with ${classToolMap.size} entries`
+      : ""
+  );
+
   const versions = useRootTrack
-    ? buildRootVersions(rootChapters)
+    ? buildRootVersions(rootChapters, classToolMap)
     : buildLegacyVersions();
   const docs = useRootTrack ? buildRootDocs(rootChapters) : buildLegacyDocs();
 

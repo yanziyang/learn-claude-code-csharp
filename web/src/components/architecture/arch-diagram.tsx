@@ -3,7 +3,10 @@
 import { motion } from "framer-motion";
 import { cn } from "@/lib/utils";
 import { LAYERS } from "@/lib/constants";
-import versionsData from "@/data/generated/versions.json";
+import type { VersionIndex } from "@/types/agent-data";
+import versionsDataRaw from "@/data/generated/versions.json";
+
+const versionsData = versionsDataRaw as VersionIndex;
 
 const CLASS_DESCRIPTIONS: Record<string, string> = {
   TodoManager: "Visible task planning with constraints",

@@ -6,7 +6,10 @@ import { useTranslations, useLocale } from "@/lib/i18n";
 import { LEARNING_PATH, VERSION_META, LAYERS } from "@/lib/constants";
 import { LayerBadge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
-import versionsData from "@/data/generated/versions.json";
+import type { VersionIndex } from "@/types/agent-data";
+import versionsDataRaw from "@/data/generated/versions.json";
+
+const versionsData = versionsDataRaw as VersionIndex;
 
 const LAYER_DOT_BG: Record<string, string> = {
   tools: "bg-blue-500",
