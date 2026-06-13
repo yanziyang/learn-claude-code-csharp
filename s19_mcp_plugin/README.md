@@ -159,7 +159,7 @@ def agent_loop(messages, context):
 
 ```sh
 cd learn-claude-code
-python s19_mcp_plugin/code.py
+dotnet run --project s19_mcp_plugin
 ```
 
 试试这些 prompt：

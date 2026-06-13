@@ -203,7 +203,7 @@ LLM 返回非 tool_use
 
 ```sh
 cd learn-claude-code
-python s16_team_protocols/code.py
+dotnet run --project s16_team_protocols
 ```
 
 试试这些 prompt：

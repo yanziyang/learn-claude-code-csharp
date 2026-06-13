@@ -40,48 +40,48 @@ When model calls load_skill("git"):
 ```
 skills/
   pdf/
-    SKILL.md       # ---\n name: pdf\n description: Process PDF files\n ---\n ...
+    SKILL.md       # ---\nname: pdf\ndescription: Process PDF files\n---\n...
   code-review/
-    SKILL.md       # ---\n name: code-review\n description: Review code\n ---\n ...
+    SKILL.md       # ---\nname: code-review\ndescription: Review code\n---\n...
 ```
 
-2. SkillLoader 递归扫描 `SKILL.md` 文件, 用目录名作为 Skill 标识。
+2. `SkillRegistry` 递归扫描 `SKILL.md` 文件, 解析 frontmatter 并用目录名作为 Skill 标识 (`AgentCommon/Skills/SkillRegistry.cs`)。
 
-```python
-class SkillLoader:
-    def __init__(self, skills_dir: Path):
-        self.skills = {}
-        for f in sorted(skills_dir.rglob("SKILL.md")):
-            text = f.read_text()
-            meta, body = self._parse_frontmatter(text)
-            name = meta.get("name", f.parent.name)
-            self.skills[name] = {"meta": meta, "body": body}
+```csharp
+public static SkillRegistry LoadFromDir(string skillsDir)
+{
+    var reg = new SkillRegistry();
+    if (!Directory.Exists(skillsDir)) return reg;
 
-    def get_descriptions(self) -> str:
-        lines = []
-        for name, skill in self.skills.items():
-            desc = skill["meta"].get("description", "")
-            lines.append(f"  - {name}: {desc}")
-        return "\n".join(lines)
+    foreach (var dir in Directory.EnumerateDirectories(skillsDir))
+    {
+        var manifest = Path.Combine(dir, "SKILL.md");
+        if (!File.Exists(manifest)) continue;
 
-    def get_content(self, name: str) -> str:
-        skill = self.skills.get(name)
-        if not skill:
-            return f"Error: Unknown skill '{name}'."
-        return f"<skill name=\"{name}\">\n{skill['body']}\n</skill>"
-```
-
-3. 第一层写入系统提示。第二层不过是 dispatch map 中的又一个工具。
-
-```python
-SYSTEM = f"""You are a coding agent at {WORKDIR}.
-Skills available:
-{SKILL_LOADER.get_descriptions()}"""
-
-TOOL_HANDLERS = {
-    # ...base tools...
-    "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
+        var raw = File.ReadAllText(manifest);
+        var (name, desc) = ParseFrontmatter(raw);
+        if (string.IsNullOrEmpty(name)) name = Path.GetFileName(dir);
+        reg._byName[name] = new SkillManifest
+        {
+            Name = name,
+            Description = desc,
+            FullContent = raw,
+        };
+    }
+    return reg;
 }
+```
+
+3. 第一层写入系统提示。第二层不过是注册表中的又一个工具。
+
+```csharp
+var skills = SkillRegistry.LoadFromDir(skillsDir);
+
+var system = $"You are a coding agent at {workDir}.\n" +
+             $"Skills available:\n{skills.Catalog()}";
+
+SkillTools.Register(tools, skills);
+// → 注册 "load_skill" 工具, 返回 SkillManifest.FullContent
 ```
 
 模型知道有哪些 Skill (便宜), 需要时再加载完整内容 (贵)。
@@ -92,14 +92,14 @@ TOOL_HANDLERS = {
 |----------------|------------------|--------------------------------|
 | Tools          | 5 (基础 + task)  | 5 (基础 + load_skill)          |
 | 系统提示       | 静态字符串       | + Skill 描述列表               |
-| 知识库         | 无               | skills/\*/SKILL.md 文件        |
+| 知识库         | 无               | skills/*/SKILL.md files        |
 | 注入方式       | 无               | 两层 (系统提示 + result)       |
 
 ## 试一试
 
 ```sh
-cd learn-claude-code
-python agents/s05_skill_loading.py
+cd learn-claude-code-csharp
+dotnet run --project s07_skill_loading
 ```
 
 试试这些 prompt (英文 prompt 对 LLM 效果更好, 也可以用中文):

@@ -22,7 +22,7 @@ On multi-step tasks, the model loses track. It repeats work, skips steps, or wan
                     +----------------+
                           |
               +-----------+-----------+
-              | TodoManager state     |
+              | TodoState              |
               | [ ] task A            |
               | [>] task B  <- doing  |
               | [x] task C            |
@@ -34,63 +34,75 @@ On multi-step tasks, the model loses track. It repeats work, skips steps, or wan
 
 ## How It Works
 
-1. TodoManager stores items with statuses. Only one item can be `in_progress` at a time.
+1. A `TodoState` stores items with statuses. Only one item can be `in_progress` at a time.
 
-```python
-class TodoManager:
-    def update(self, items: list) -> str:
-        validated, in_progress_count = [], 0
-        for item in items:
-            status = item.get("status", "pending")
-            if status == "in_progress":
-                in_progress_count += 1
-            validated.append({"id": item["id"], "text": item["text"],
-                              "status": status})
-        if in_progress_count > 1:
-            raise ValueError("Only one task can be in_progress")
-        self.items = validated
-        return self.render()
-```
+```csharp
+public sealed class TodoState
+{
+    public List<TodoItem> Items { get; private set; } = new();
+    public event Action? Changed;
 
-2. The `todo` tool goes into the dispatch map like any other tool.
+    public void Update(List<TodoItem> items)
+    {
+        Items = items;
+        Changed?.Invoke();
+    }
 
-```python
-TOOL_HANDLERS = {
-    # ...base tools...
-    "todo": lambda **kw: TODO.update(kw["items"]),
+    public void Render()
+    {
+        Console.WriteLine("\n## Current Tasks");
+        foreach (var t in Items)
+        {
+            var icon = t.status switch
+            {
+                "completed"   => "x",
+                "in_progress" => ">",
+                _             => " ",
+            };
+            Console.WriteLine($"  [{icon}] {t.content}");
+        }
+    }
 }
 ```
 
-3. A nag reminder injects a nudge if the model goes 3+ rounds without calling `todo`.
+2. The `todo_write` tool goes into the registry like any other tool.
 
-```python
-if rounds_since_todo >= 3 and messages:
-    last = messages[-1]
-    if last["role"] == "user" and isinstance(last.get("content"), list):
-        last["content"].insert(0, {
-            "type": "text",
-            "text": "<reminder>Update your todos.</reminder>",
-        })
+```csharp
+var todos = new TodoTools.TodoState();
+TodoTools.Register(tools, todos);
 ```
 
-The "one in_progress at a time" constraint forces sequential focus. The nag reminder creates accountability.
+3. After updating, the rendered list is shown back to the model so it sees the same view the user does.
+
+```csharp
+tools.Register("todo_write", "Create and manage a task list for your current coding session.",
+    /* schema */, input =>
+    {
+        var items = ParseTodos(input);
+        state.Update(items);
+        state.Render();      // mirrored back into the model's context
+        return $"Updated {items.Count} tasks";
+    });
+```
+
+The "one in_progress at a time" constraint forces sequential focus. Rendering the list into the tool result creates accountability.
 
 ## What Changed From s02
 
 | Component      | Before (s02)     | After (s03)                |
 |----------------|------------------|----------------------------|
-| Tools          | 4                | 5 (+todo)                  |
-| Planning       | None             | TodoManager with statuses  |
-| Nag injection  | None             | `<reminder>` after 3 rounds|
-| Agent loop     | Simple dispatch  | + rounds_since_todo counter|
+| Tools          | 4                | 5 (+todo_write)            |
+| Planning       | None             | `TodoState` with statuses  |
+| Mirror         | None             | Rendered list into result  |
+| Agent loop     | Simple dispatch  | Unchanged                  |
 
 ## Try It
 
 ```sh
-cd learn-claude-code
-python agents/s03_todo_write.py
+cd learn-claude-code-csharp
+dotnet run --project s05_todo_write
 ```
 
-1. `Refactor the file hello.py: add type hints, docstrings, and a main guard`
-2. `Create a Python package with __init__.py, utils.py, and tests/test_utils.py`
-3. `Review all Python files and fix any style issues`
+1. `Refactor the file hello.cs: add XML doc comments and a main guard`
+2. `Create a small class library with Class1.cs, Utils.cs, and tests/UtilsTests.cs`
+3. `Review all C# files in this project and fix any obvious style issues`

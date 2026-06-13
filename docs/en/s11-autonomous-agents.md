@@ -47,74 +47,98 @@ Identity re-injection after compression:
 
 ## How It Works
 
-1. The teammate loop has two phases: WORK and IDLE. When the LLM stops calling tools (or calls `idle`), the teammate enters IDLE.
+1. The teammate loop has two phases: WORK and IDLE. When the LLM stops calling tools (or calls an `idle` tool), the teammate enters IDLE.
 
-```python
-def _loop(self, name, role, prompt):
-    while True:
-        # -- WORK PHASE --
-        messages = [{"role": "user", "content": prompt}]
-        for _ in range(50):
-            response = client.messages.create(...)
-            if response.stop_reason != "tool_use":
-                break
-            # execute tools...
-            if idle_requested:
-                break
+```csharp
+public async Task RunAsync(string prompt, CancellationToken ct = default)
+{
+    var messages = new List<Message> { Message.UserText(prompt) };
 
-        # -- IDLE PHASE --
-        self._set_status(name, "idle")
-        resume = self._idle_poll(name, messages)
-        if not resume:
-            self._set_status(name, "shutdown")
-            return
-        self._set_status(name, "working")
+    // -- WORK PHASE --
+    for (var i = 0; i < _maxRounds; i++)
+    {
+        var response = await _client.CreateMessageAsync(
+            _systemPrompt, messages, _tools.AllSpecs().ToList(), ct: ct);
+        messages.Add(Message.Assistant(response.Content));
+
+        if (response.StopReason != "tool_use") break;
+
+        var results = new List<ToolResultBlock>();
+        foreach (var block in response.Content.OfType<ToolUseBlock>())
+        {
+            var output = _tools.Invoke(block.Name, block.Input);
+            results.Add(new ToolResultBlock(block.Id, output));
+        }
+        messages.Add(Message.UserToolResults(results));
+    }
+
+    // -- IDLE PHASE --
+    while (!ct.IsCancellationRequested)
+    {
+        var resumed = await IdlePollAsync(messages, ct);
+        if (!resumed) break;     // timeout -> SHUTDOWN
+    }
+}
 ```
 
-2. The idle phase polls inbox and task board in a loop.
+2. The idle phase polls the inbox and the task board in a loop.
 
-```python
-def _idle_poll(self, name, messages):
-    for _ in range(IDLE_TIMEOUT // POLL_INTERVAL):  # 60s / 5s = 12
-        time.sleep(POLL_INTERVAL)
-        inbox = BUS.read_inbox(name)
-        if inbox:
-            messages.append({"role": "user",
-                "content": f"<inbox>{inbox}</inbox>"})
-            return True
-        unclaimed = scan_unclaimed_tasks()
-        if unclaimed:
-            claim_task(unclaimed[0]["id"], name)
-            messages.append({"role": "user",
-                "content": f"<auto-claimed>Task #{unclaimed[0]['id']}: "
-                           f"{unclaimed[0]['subject']}</auto-claimed>"})
-            return True
-    return False  # timeout -> shutdown
+```csharp
+async Task<bool> IdlePollAsync(List<Message> messages, CancellationToken ct)
+{
+    for (var i = 0; i < IdleTimeoutSeconds / PollIntervalSeconds; i++)
+    {
+        await Task.Delay(TimeSpan.FromSeconds(PollIntervalSeconds), ct);
+
+        // 1. Inbox?
+        var inbox = bus.ReadInbox(_name);
+        if (inbox.Count > 0)
+        {
+            messages.Add(Message.UserText(
+                "<inbox>\n" + JsonSerializer.Serialize(inbox, new JsonSerializerOptions { WriteIndented = true })
+                + "\n</inbox>"));
+            return true;
+        }
+
+        // 2. Unclaimed task?
+        var candidate = _store.List().FirstOrDefault(t =>
+            t.Status == "pending"
+            && string.IsNullOrEmpty(t.Owner)
+            && _store.CanStart(t));
+        if (candidate is not null)
+        {
+            var (ok, _) = _store.Claim(candidate.Id, _name);
+            if (ok)
+            {
+                messages.Add(Message.UserText(
+                    $"<auto-claimed>Task #{candidate.Id}: {candidate.Subject}</auto-claimed>"));
+                return true;
+            }
+        }
+    }
+    return false;   // timeout -> SHUTDOWN
+}
 ```
 
 3. Task board scanning: find pending, unowned, unblocked tasks.
 
-```python
-def scan_unclaimed_tasks() -> list:
-    unclaimed = []
-    for f in sorted(TASKS_DIR.glob("task_*.json")):
-        task = json.loads(f.read_text())
-        if (task.get("status") == "pending"
-                and not task.get("owner")
-                and not task.get("blockedBy")):
-            unclaimed.append(task)
-    return unclaimed
+```csharp
+var candidate = _store.List().FirstOrDefault(t =>
+    t.Status == "pending"
+    && string.IsNullOrEmpty(t.Owner)
+    && _store.CanStart(t));
 ```
 
 4. Identity re-injection: when context is too short (compression happened), insert an identity block.
 
-```python
-if len(messages) <= 3:
-    messages.insert(0, {"role": "user",
-        "content": f"<identity>You are '{name}', role: {role}, "
-                   f"team: {team_name}. Continue your work.</identity>"})
-    messages.insert(1, {"role": "assistant",
-        "content": f"I am {name}. Continuing."})
+```csharp
+if (messages.Count <= 3)
+{
+    messages.Insert(0, Message.UserText(
+        $"<identity>You are '{_name}', role: {_role}, " +
+        $"team: {_teamName}. Continue your work.</identity>"));
+    messages.Insert(1, Message.AssistantText($"I am {_name}. Continuing."));
+}
 ```
 
 ## What Changed From s10
@@ -125,14 +149,14 @@ if len(messages) <= 3:
 | Autonomy       | Lead-directed    | Self-organizing            |
 | Idle phase     | None             | Poll inbox + task board    |
 | Task claiming  | Manual only      | Auto-claim unclaimed tasks |
-| Identity       | System prompt    | + re-injection after compress|
+| Identity       | System prompt    | + re-injection after compact|
 | Timeout        | None             | 60s idle -> auto shutdown  |
 
 ## Try It
 
 ```sh
-cd learn-claude-code
-python agents/s11_autonomous_agents.py
+cd learn-claude-code-csharp
+dotnet run --project s17_autonomous_agents
 ```
 
 1. `Create 3 tasks on the board, then spawn alice and bob. Watch them auto-claim.`

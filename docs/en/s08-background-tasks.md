@@ -2,20 +2,20 @@
 
 `s01 > s02 > s03 > s04 > s05 > s06 | s07 > [ s08 ] s09 > s10 > s11 > s12`
 
-> *"Run slow operations in the background; the agent keeps thinking"* -- daemon threads run commands, inject notifications on completion.
+> *"Run slow operations in the background; the agent keeps thinking"* -- background tasks run commands, inject notifications on completion.
 >
 > **Harness layer**: Background execution -- the model thinks while the harness waits.
 
 ## Problem
 
-Some commands take minutes: `npm install`, `pytest`, `docker build`. With a blocking loop, the model sits idle waiting. If the user asks "install dependencies and while that runs, create the config file," the agent does them sequentially, not in parallel.
+Some commands take minutes: `dotnet build`, `dotnet test`, `docker build`. With a blocking loop, the model sits idle waiting. If the user asks "install dependencies and while that runs, create the config file," the agent does them sequentially, not in parallel.
 
 ## Solution
 
 ```
-Main thread                Background thread
+Main thread                Background threads
 +-----------------+        +-----------------+
-| agent loop      |        | subprocess runs |
+| agent loop      |        | Task.Run(work)  |
 | ...             |        | ...             |
 | [LLM call] <---+------- | enqueue(result) |
 |  ^drain queue   |        +-----------------+
@@ -32,56 +32,66 @@ Agent --[spawn A]--[spawn B]--[other work]----
 
 ## How It Works
 
-1. BackgroundManager tracks tasks with a thread-safe notification queue.
+1. `BackgroundRunner` tracks tasks with a thread-safe notification queue (`AgentCommon/Background/BackgroundRunner.cs`).
 
-```python
-class BackgroundManager:
-    def __init__(self):
-        self.tasks = {}
-        self._notification_queue = []
-        self._lock = threading.Lock()
+```csharp
+public sealed class BackgroundRunner
+{
+    private readonly ConcurrentDictionary<string, BackgroundTask> _tasks = new();
+    private int _counter = 0;
+
+    public string Start(string toolUseId, string command, Func<string> work)
+    {
+        var id = $"bg_{Interlocked.Increment(ref _counter):D4}";
+        var task = Task.Run(work);
+        _tasks[id] = new BackgroundTask(id, toolUseId, command, task);
+        return id;
+    }
+}
 ```
 
-2. `run()` starts a daemon thread and returns immediately.
+2. The `bash` tool can dispatch a command into the background by passing `run_in_background=true`.
 
-```python
-def run(self, command: str) -> str:
-    task_id = str(uuid.uuid4())[:8]
-    self.tasks[task_id] = {"status": "running", "command": command}
-    thread = threading.Thread(
-        target=self._execute, args=(task_id, command), daemon=True)
-    thread.start()
-    return f"Background task {task_id} started"
+```csharp
+if (runInBackground && background is not null)
+{
+    var bgId = background.Start(toolUseId, cmd, () =>
+    {
+        var r = BashRunner.Run(cmd, workDir);
+        return (r.StdOut + r.StdErr).Trim();
+    });
+    return $"<background-task id=\"{bgId}\" status=\"running\"/>\n" +
+           $"Command dispatched in background. You will be notified on completion.";
+}
 ```
 
-3. When the subprocess finishes, its result goes into the notification queue.
+3. The agent loop drains completed background tasks before each LLM call and injects notifications.
 
-```python
-def _execute(self, task_id, command):
-    try:
-        r = subprocess.run(command, shell=True, cwd=WORKDIR,
-            capture_output=True, text=True, timeout=300)
-        output = (r.stdout + r.stderr).strip()[:50000]
-    except subprocess.TimeoutExpired:
-        output = "Error: Timeout (300s)"
-    with self._lock:
-        self._notification_queue.append({
-            "task_id": task_id, "result": output[:500]})
+```csharp
+// In an OnBeforeLlmCall hook (see s20 for the wiring):
+var done = background.DrainCompleted();
+if (done.Count > 0)
+    messages.Add(Message.UserText(background.FormatNotifications(done)));
 ```
 
-4. The agent loop drains notifications before each LLM call.
+4. `FormatNotifications` renders the drained results as XML the model can parse.
 
-```python
-def agent_loop(messages: list):
-    while True:
-        notifs = BG.drain_notifications()
-        if notifs:
-            notif_text = "\n".join(
-                f"[bg:{n['task_id']}] {n['result']}" for n in notifs)
-            messages.append({"role": "user",
-                "content": f"<background-results>\n{notif_text}\n"
-                           f"</background-results>"})
-        response = client.messages.create(...)
+```csharp
+public string FormatNotifications(IReadOnlyList<BackgroundTask> done)
+{
+    var sb = new StringBuilder();
+    foreach (var t in done)
+    {
+        var summary = SafeResult(t);
+        sb.AppendLine("<task_notification>");
+        sb.AppendLine($"  <task_id>{t.BgId}</task_id>");
+        sb.AppendLine($"  <status>completed</status>");
+        sb.AppendLine($"  <command>{t.Command}</command>");
+        sb.AppendLine($"  <summary>{summary}</summary>");
+        sb.AppendLine("</task_notification>");
+    }
+    return sb.ToString();
+}
 ```
 
 The loop stays single-threaded. Only subprocess I/O is parallelized.
@@ -90,18 +100,18 @@ The loop stays single-threaded. Only subprocess I/O is parallelized.
 
 | Component      | Before (s07)     | After (s08)                |
 |----------------|------------------|----------------------------|
-| Tools          | 8                | 6 (base + background_run + check)|
-| Execution      | Blocking only    | Blocking + background threads|
+| Tools          | 8                | Same tools; bash gains `run_in_background` |
+| Execution      | Blocking only    | Blocking + background tasks|
 | Notification   | None             | Queue drained per loop     |
-| Concurrency    | None             | Daemon threads             |
+| Concurrency    | None             | `Task.Run` workers         |
 
 ## Try It
 
 ```sh
-cd learn-claude-code
-python agents/s08_background_tasks.py
+cd learn-claude-code-csharp
+dotnet run --project s13_background_tasks
 ```
 
 1. `Run "sleep 5 && echo done" in the background, then create a file while it runs`
 2. `Start 3 background tasks: "sleep 2", "sleep 4", "sleep 6". Check their status.`
-3. `Run pytest in the background and keep working on other things`
+3. `Run dotnet build in the background and keep working on other things`

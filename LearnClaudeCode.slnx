@@ -1,0 +1,23 @@
+<Solution>
+  <Project Path="AgentCommon/AgentCommon.csproj" />
+  <Project Path="s01_agent_loop/s01_agent_loop.csproj" />
+  <Project Path="s02_tool_use/s02_tool_use.csproj" />
+  <Project Path="s03_permission/s03_permission.csproj" />
+  <Project Path="s04_hooks/s04_hooks.csproj" />
+  <Project Path="s05_todo_write/s05_todo_write.csproj" />
+  <Project Path="s06_subagent/s06_subagent.csproj" />
+  <Project Path="s07_skill_loading/s07_skill_loading.csproj" />
+  <Project Path="s08_context_compact/s08_context_compact.csproj" />
+  <Project Path="s09_memory/s09_memory.csproj" />
+  <Project Path="s10_system_prompt/s10_system_prompt.csproj" />
+  <Project Path="s11_error_recovery/s11_error_recovery.csproj" />
+  <Project Path="s12_task_system/s12_task_system.csproj" />
+  <Project Path="s13_background_tasks/s13_background_tasks.csproj" />
+  <Project Path="s14_cron_scheduler/s14_cron_scheduler.csproj" />
+  <Project Path="s15_agent_teams/s15_agent_teams.csproj" />
+  <Project Path="s16_team_protocols/s16_team_protocols.csproj" />
+  <Project Path="s17_autonomous_agents/s17_autonomous_agents.csproj" />
+  <Project Path="s18_worktree_isolation/s18_worktree_isolation.csproj" />
+  <Project Path="s19_mcp_plugin/s19_mcp_plugin.csproj" />
+  <Project Path="s20_comprehensive/s20_comprehensive.csproj" />
+</Solution>

@@ -19,94 +19,98 @@ Teammate lifecycle:
   spawn -> WORKING -> IDLE -> WORKING -> ... -> SHUTDOWN
 
 Communication:
-  .team/
-    config.json           <- team roster + statuses
-    inbox/
-      alice.jsonl         <- append-only, drain-on-read
-      bob.jsonl
-      lead.jsonl
+  .mailboxes/
+    lead.jsonl            <- append-only, drain-on-read
+    alice.jsonl
+    bob.jsonl
 
-              +--------+    send("alice","bob","...")    +--------+
+              +--------+    bus.Send("alice","bob","...")   +--------+
               | alice  | -----------------------------> |  bob   |
               | loop   |    bob.jsonl << {json_line}    |  loop  |
               +--------+                                +--------+
                    ^                                         |
-                   |        BUS.read_inbox("alice")          |
+                   |        bus.ReadInbox("alice")          |
                    +---- alice.jsonl -> read + drain ---------+
 ```
 
 ## 工作原理
 
-1. TeammateManager 通过 config.json 维护团队名册。
+1. `MessageBus` 在 `.mailboxes/` 下为每个 Agent 写一个 JSONL 文件 (`AgentCommon/Teams/MessageBus.cs`)。
 
-```python
-class TeammateManager:
-    def __init__(self, team_dir: Path):
-        self.dir = team_dir
-        self.dir.mkdir(exist_ok=True)
-        self.config_path = self.dir / "config.json"
-        self.config = self._load_config()
-        self.threads = {}
+```csharp
+public sealed class MessageBus
+{
+    private readonly string _mailboxDir;
+
+    public MessageBus(string workDir, Action<string>? onLog = null)
+    {
+        _mailboxDir = Path.Combine(workDir, ".mailboxes");
+        Directory.CreateDirectory(_mailboxDir);
+    }
+
+    public void Send(string from, string to, string content, string msgType = "message")
+    {
+        var msg = new MailboxMessage
+        {
+            From = from, To = to, Content = content, Type = msgType,
+            Ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0,
+        };
+        var inbox = Path.Combine(_mailboxDir, $"{to}.jsonl");
+        lock (_lock)
+        {
+            File.AppendAllText(inbox, JsonSerializer.Serialize(msg) + "\n");
+        }
+    }
+}
 ```
 
-2. `spawn()` 创建队友并在线程中启动 agent loop。
+2. `ReadInbox` 在一次调用中消费整个收件箱: 读取全部行, 删除文件。
 
-```python
-def spawn(self, name: str, role: str, prompt: str) -> str:
-    member = {"name": name, "role": role, "status": "working"}
-    self.config["members"].append(member)
-    self._save_config()
-    thread = threading.Thread(
-        target=self._teammate_loop,
-        args=(name, role, prompt), daemon=True)
-    thread.start()
-    return f"Spawned teammate '{name}' (role: {role})"
+```csharp
+public List<MailboxMessage> ReadInbox(string agent)
+{
+    var inbox = Path.Combine(_mailboxDir, $"{agent}.jsonl");
+    if (!File.Exists(inbox)) return new List<MailboxMessage>();
+
+    List<MailboxMessage> msgs;
+    lock (_lock)
+    {
+        var lines = File.ReadAllText(inbox).Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        msgs = lines.Select(l => JsonSerializer.Deserialize<MailboxMessage>(l)!).ToList();
+        File.Delete(inbox);   // 消费: 读 + 删
+    }
+    return msgs;
+}
 ```
 
-3. MessageBus: append-only 的 JSONL 收件箱。`send()` 追加一行; `read_inbox()` 读取全部并清空。
+3. `TeamTools` 在 lead 端注册三个工具: `spawn_teammate`, `send_message`, `check_inbox`。
 
-```python
-class MessageBus:
-    def send(self, sender, to, content, msg_type="message", extra=None):
-        msg = {"type": msg_type, "from": sender,
-               "content": content, "timestamp": time.time()}
-        if extra:
-            msg.update(extra)
-        with open(self.dir / f"{to}.jsonl", "a") as f:
-            f.write(json.dumps(msg) + "\n")
-
-    def read_inbox(self, name):
-        path = self.dir / f"{name}.jsonl"
-        if not path.exists(): return "[]"
-        msgs = [json.loads(l) for l in path.read_text().strip().splitlines() if l]
-        path.write_text("")  # drain
-        return json.dumps(msgs, indent=2)
+```csharp
+var bus = new MessageBus(workDir);
+TeamTools.Register(tools, bus, client, config, workDir);
+// → spawn_teammate: 后台线程启动 TeammateRunner
+// → send_message:  bus.Send("lead", to, content)
+// → check_inbox:   bus.ReadInbox("lead") (已排空)
 ```
 
-4. 每个队友在每次 LLM 调用前检查收件箱, 将消息注入上下文。
+4. 每个 `TeammateRunner` 在每次 LLM 调用前检查自己的收件箱, 把消息注入上下文。
 
-```python
-def _teammate_loop(self, name, role, prompt):
-    messages = [{"role": "user", "content": prompt}]
-    for _ in range(50):
-        inbox = BUS.read_inbox(name)
-        if inbox != "[]":
-            messages.append({"role": "user",
-                "content": f"<inbox>{inbox}</inbox>"})
-        response = client.messages.create(...)
-        if response.stop_reason != "tool_use":
-            break
-        # execute tools, append results...
-    self._find_member(name)["status"] = "idle"
+```csharp
+// TeammateRunner 钩子内 (摘要):
+var msgs = bus.ReadInbox(name);
+if (msgs.Count > 0)
+    messages.Add(Message.UserText(
+        "<inbox>\n" + JsonSerializer.Serialize(msgs, new JsonSerializerOptions { WriteIndented = true })
+        + "\n</inbox>"));
 ```
 
 ## 相对 s08 的变更
 
 | 组件           | 之前 (s08)       | 之后 (s09)                         |
 |----------------|------------------|------------------------------------|
-| Tools          | 6                | 9 (+spawn/send/read_inbox)         |
+| Tools          | 6                | 9 (+spawn/send/check_inbox)        |
 | Agent 数量     | 单一             | 领导 + N 个队友                    |
-| 持久化         | 无               | config.json + JSONL 收件箱         |
+| 持久化         | 无               | JSONL inboxes under .mailboxes/   |
 | 线程           | 后台命令         | 每线程完整 agent loop              |
 | 生命周期       | 一次性           | idle -> working -> idle            |
 | 通信           | 无               | message + broadcast                |
@@ -114,8 +118,8 @@ def _teammate_loop(self, name, role, prompt):
 ## 试一试
 
 ```sh
-cd learn-claude-code
-python agents/s09_agent_teams.py
+cd learn-claude-code-csharp
+dotnet run --project s15_agent_teams
 ```
 
 试试这些 prompt (英文 prompt 对 LLM 效果更好, 也可以用中文):

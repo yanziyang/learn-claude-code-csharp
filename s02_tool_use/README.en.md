@@ -136,7 +136,7 @@ The teaching version executes them one by one in the original `response.content`
 
 ```sh
 cd learn-claude-code
-python s02_tool_use/code.py
+dotnet run --project s02_tool_use
 ```
 
 Try these prompts:
@@ -144,7 +144,7 @@ Try these prompts:
 1. `Read the file README.md and tell me what this project is about`
 2. `Create a file called test.py that prints "hello", then read it back`
 3. `Find all Python files in this directory`
-4. `Read both README.md and requirements.txt, then create a summary file`
+4. `Read both README.md and Program.cs, then create a summary file`
 
 What to watch for: When does the model call just one tool, and when does it call multiple at once? Are multiple tool calls executed in the correct order?
 

@@ -118,15 +118,16 @@ def agent_loop(messages):
 **准备**（首次运行）：
 
 ```sh
-pip install -r requirements.txt
-cp .env.example .env
-# 编辑 .env，填入 ANTHROPIC_API_KEY 和 MODEL_ID
+dotnet build
+cp s01_agent_loop/appsettings.example.json s01_agent_loop/appsettings.json
+# 编辑 s01_agent_loop/appsettings.json，把 PUT-YOUR-KEY-HERE 替换成 DeepSeek API key
+# 也可以设置环境变量 DEEPSEEK_API_KEY=sk-...
 ```
 
 **运行**：
 
 ```sh
-python s01_agent_loop/code.py
+dotnet run --project s01_agent_loop
 ```
 
 试试这些 prompt：

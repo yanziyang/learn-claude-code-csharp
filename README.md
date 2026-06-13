@@ -4,6 +4,12 @@
 
 # Learn Claude Code -- Harness Engineering for Real Agents
 
+> A 20-lesson harness engineering tutorial in .NET 10 / C#. Each chapter
+> ships as a self-contained `Program.cs` console app, sharing one
+> `AgentCommon/` class library. The default engine is **DeepSeek
+> (`deepseek-v4-flash`)** via its Anthropic-compatible endpoint; you
+> provide your own API key.
+
 ## Agency Comes from the Model. An Agent Product = Model + Harness.
 
 Before we write any code, one thing needs to be clear.
@@ -132,29 +138,30 @@ The takeaway is not "copy Claude Code." The takeaway is: **the best agent produc
 
 ## Core Pattern
 
-```python
-def agent_loop(messages):
-    while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM,
-            messages=messages, tools=TOOLS,
-        )
-        messages.append({"role": "assistant",
-                         "content": response.content})
+The agent loop is the same shape across every lesson. The C# version
+lives in `AgentCommon/Agent/AgentHarness.cs` and is the file every
+`Program.cs` ultimately calls into.
 
-        if response.stop_reason != "tool_use":
-            return
+**C#** (`AgentCommon/Agent/AgentHarness.cs`, abbreviated):
+```csharp
+public async Task<LlmResponse> RunAsync(List<Message> messages, CancellationToken ct = default)
+{
+    var response = await Client.CreateMessageAsync(
+        SystemPrompt, messages, Tools.AllSpecs().ToList(), ct: ct);
+    messages.Add(Message.Assistant(response.Content));
 
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                output = TOOL_HANDLERS[block.name](**block.input)
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": output,
-                })
-        messages.append({"role": "user", "content": results})
+    if (response.StopReason != "tool_use")
+        return response;
+
+    var results = new List<ToolResultBlock>();
+    foreach (var block in response.Content.OfType<ToolUseBlock>())
+    {
+        var output = Tools.Invoke(block.Name, block.Input);
+        results.Add(new ToolResultBlock(block.Id, output));
+    }
+    messages.Add(Message.UserToolResults(results));
+    return response;
+}
 ```
 
 Every lesson layers one harness mechanism on top of this loop -- the loop itself never changes. The loop belongs to the agent. The mechanisms belong to the harness.
@@ -165,32 +172,15 @@ The loop is constant. Tools, knowledge, and permissions change. Agent = Model (L
 
 ## Version Status
 
-This repository currently contains two tutorial tracks:
+This repository contains the current 20-lesson track. The root-level
+`s01_*` ... `s20_*` folders are the canonical version. Each chapter
+contains a full narrative `README.md` (with English and Japanese
+translations) and a runnable .NET 10 / C# `Program.cs` (plus the
+shared `AgentCommon/` library).
 
-- **Current track: root-level `s01-s20`**
-  The root-level `s01_*` ... `s20_*` folders are the new canonical version. Each chapter contains a full narrative README, translations, runnable `code.py`, and diagrams where needed.
-- **Legacy transition track: `docs/`, `agents/`, and the current `web/` app**
-  These still preserve the older 12-lesson version. They are kept temporarily for existing readers, old links, and the web platform while the new 20-lesson track settles.
-
-If you are starting now, read the root-level `s01_agent_loop/` through `s20_comprehensive/` chapters. If you are following an older link or using the current web app, you are likely reading the legacy 12-lesson track. The legacy and current chapter numbers do not always match, so avoid mixing chapter numbers across tracks.
-
-### Legacy-to-Current Mapping
-
-| Legacy 12-lesson track | Current 20-lesson track | Topic |
-|---|---|---|
-| old s01 | new s01 | Agent Loop |
-| old s02 | new s02 | Tool Use |
-| old s03 | new s05 | TodoWrite |
-| old s04 | new s06 | Subagent |
-| old s05 | new s07 | Skill Loading |
-| old s06 | new s08 | Context Compact |
-| old s07 | new s12 | Task System |
-| old s08 | new s13 | Background Tasks |
-| old s09 | new s15 | Agent Teams |
-| old s10 | new s16 | Team Protocols |
-| old s11 | new s17 | Autonomous Agents |
-| old s12 | new s18 | Worktree Isolation |
-| new only | s03, s04, s09, s10, s11, s14, s19, s20 | Permission, Hooks, Memory, System Prompt, Error Recovery, Cron, MCP, Comprehensive Agent |
+The legacy 12-lesson track was previously preserved under `docs/`,
+`agents/`, and the `web/` app. Those have been retired; the new
+20-lesson track supersedes them.
 
 ---
 
@@ -305,28 +295,34 @@ flowchart TD
 
 ## All Chapters
 
-| Chapter | Topic | Key Concepts |
-|---|---|---|
-| [s01](./s01_agent_loop/) | Agent Loop | `messages` / `while True` / `stop_reason` |
-| [s02](./s02_tool_use/) | Tool Use | `TOOL_HANDLERS` / dispatch map / concurrency |
-| [s03](./s03_permission/) | Permission System | `PermissionRule` / approval pipeline |
-| [s04](./s04_hooks/) | Hook System | `PreToolUse` / `PostToolUse` / extension points |
-| [s05](./s05_todo_write/) | TodoWrite | `TodoItem` / plan-then-execute |
-| [s06](./s06_subagent/) | Subagent | `fresh messages[]` / context isolation |
-| [s07](./s07_skill_loading/) | Skill Loading | `SkillManifest` / on-demand injection |
-| [s08](./s08_context_compact/) | Context Compact | snipCompact / microCompact / toolResultBudget / autoCompact |
-| [s09](./s09_memory/) | Memory System | selection / extraction / consolidation |
-| [s10](./s10_system_prompt/) | System Prompt | runtime assembly / section concatenation |
-| [s11](./s11_error_recovery/) | Error Recovery | token escalation / fallback model / retry strategies |
-| [s12](./s12_task_system/) | Task System | `TaskRecord` / `blockedBy` / disk persistence |
-| [s13](./s13_background_tasks/) | Background Tasks | threaded execution / notification queue |
-| [s14](./s14_cron_scheduler/) | Cron Scheduler | durable scheduling / session-scoped triggers |
-| [s15](./s15_agent_teams/) | Agent Teams | `MessageBus` / inbox / permission bubbling |
-| [s16](./s16_team_protocols/) | Team Protocols | shutdown handshake / plan approval |
-| [s17](./s17_autonomous_agents/) | Autonomous Agents | idle cycle / auto-claim / self-organization |
-| [s18](./s18_worktree_isolation/) | Worktree Isolation | `WorktreeRecord` / task-directory binding |
-| [s19](./s19_mcp_plugin/) | MCP Plugin | multi-transport / channel routing / tool pool assembly |
-| [s20](./s20_comprehensive/) | Comprehensive Agent | all mechanisms around one loop |
+| Chapter | Topic | Key Concepts | C# |
+|---|---|---|---|
+| [s01](./s01_agent_loop/) | Agent Loop | `messages` / `while stop_reason == "tool_use"` | [Program.cs](./s01_agent_loop/Program.cs) |
+| [s02](./s02_tool_use/) | Tool Use | `ToolRegistry` / dispatch map / concurrency | [Program.cs](./s02_tool_use/Program.cs) |
+| [s03](./s03_permission/) | Permission System | `PermissionRule` / approval pipeline | [Program.cs](./s03_permission/Program.cs) |
+| [s04](./s04_hooks/) | Hook System | `PreToolUse` / `PostToolUse` / extension points | [Program.cs](./s04_hooks/Program.cs) |
+| [s05](./s05_todo_write/) | TodoWrite | `TodoItem` / plan-then-execute | [Program.cs](./s05_todo_write/Program.cs) |
+| [s06](./s06_subagent/) | Subagent | `SubagentRunner` / context isolation | [Program.cs](./s06_subagent/Program.cs) |
+| [s07](./s07_skill_loading/) | Skill Loading | `SkillManifest` / on-demand injection | [Program.cs](./s07_skill_loading/Program.cs) |
+| [s08](./s08_context_compact/) | Context Compact | snipCompact / microCompact / toolResultBudget / autoCompact | [Program.cs](./s08_context_compact/Program.cs) |
+| [s09](./s09_memory/) | Memory System | selection / extraction / consolidation | [Program.cs](./s09_memory/Program.cs) |
+| [s10](./s10_system_prompt/) | System Prompt | runtime assembly / section concatenation | [Program.cs](./s10_system_prompt/Program.cs) |
+| [s11](./s11_error_recovery/) | Error Recovery | token escalation / fallback model / retry strategies | [Program.cs](./s11_error_recovery/Program.cs) |
+| [s12](./s12_task_system/) | Task System | `TaskRecord` / `blockedBy` / disk persistence | [Program.cs](./s12_task_system/Program.cs) |
+| [s13](./s13_background_tasks/) | Background Tasks | threaded execution / notification queue | [Program.cs](./s13_background_tasks/Program.cs) |
+| [s14](./s14_cron_scheduler/) | Cron Scheduler | durable scheduling / session-scoped triggers | [Program.cs](./s14_cron_scheduler/Program.cs) |
+| [s15](./s15_agent_teams/) | Agent Teams | `MessageBus` / inbox / permission bubbling | [Program.cs](./s15_agent_teams/Program.cs) |
+| [s16](./s16_team_protocols/) | Team Protocols | shutdown handshake / plan approval | [Program.cs](./s16_team_protocols/Program.cs) |
+| [s17](./s17_autonomous_agents/) | Autonomous Agents | idle cycle / auto-claim / self-organization | [Program.cs](./s17_autonomous_agents/Program.cs) |
+| [s18](./s18_worktree_isolation/) | Worktree Isolation | `WorktreeRegistry` / task-directory binding | [Program.cs](./s18_worktree_isolation/Program.cs) |
+| [s19](./s19_mcp_plugin/) | MCP Plugin | multi-transport / channel routing / tool pool assembly | [Program.cs](./s19_mcp_plugin/Program.cs) |
+| [s20](./s20_comprehensive/) | Comprehensive Agent | all mechanisms around one loop | [Program.cs](./s20_comprehensive/Program.cs) |
+
+The .NET chapters all live in one solution (`LearnClaudeCode.slnx`)
+and share a single class library, [`AgentCommon/`](./AgentCommon/),
+that holds the LLM client, agent harness, hooks, permissions,
+compactor, memory, skills, tasks, background runner, cron, message
+bus, and teammate runtime.
 
 ---
 
@@ -339,7 +335,10 @@ s08_context_compact/
   README.md              # full narrative with inline code
   README.en.md           # English translation
   README.ja.md           # Japanese translation
-  code.py                # standalone runnable implementation
+  Program.cs             # standalone runnable implementation (.NET 10 / C#)
+  appsettings.json       # per-chapter C# config (git-ignored)
+  appsettings.example.json  # tracked template
+  s08_context_compact.csproj
   images/                # SVG diagrams (where needed)
 ```
 
@@ -351,30 +350,78 @@ Read from s01 through s20 in order. Each chapter assumes you've read the previou
 
 ## Quick Start
 
-### Current 20-Lesson Track
+### 20-Lesson Track (.NET 10 / C#)
+
+A full .NET 10 C# port lives in this folder. Each `sNN_*` chapter is a
+self-contained console app; the shared machinery lives in
+`AgentCommon/`. The harness talks to **DeepSeek** via its
+Anthropic-compatible endpoint using `deepseek-v4-flash` as the default
+model.
 
 ```sh
 git clone https://github.com/shareAI-lab/learn-claude-code
 cd learn-claude-code
-pip install -r requirements.txt
-cp .env.example .env   # configure ANTHROPIC_API_KEY
+dotnet build                                                # restore + build the whole solution
 
-python s01_agent_loop/code.py        # Start here -- one loop + bash
-python s08_context_compact/code.py   # Context compaction (complex)
-python s20_comprehensive/code.py     # Endpoint: all mechanisms in one loop
+# Configure your API key (one-time)
+cp s01_agent_loop/appsettings.example.json s01_agent_loop/appsettings.json
+# Then edit s01_agent_loop/appsettings.json and replace PUT-YOUR-KEY-HERE
+# with your DeepSeek API key. Repeat for any other chapter you want to run.
+# Alternative: set the env var DEEPSEEK_API_KEY=sk-...
+
+dotnet run --project s01_agent_loop         # Start here -- one loop + bash
+dotnet run --project s08_context_compact    # Context compaction (complex)
+dotnet run --project s20_comprehensive      # Endpoint: all mechanisms in one loop
 ```
 
-### Legacy 12-Lesson Track
+#### Configuring your API key
 
-```sh
-python agents/s01_agent_loop.py
-python agents/s12_worktree_task_isolation.py
-python agents/s_full.py
+The harness reads its config from `appsettings.json` placed next to
+the chapter you are running. `Directory.Build.props` at the repo root
+already copies any `appsettings.json` it finds into the build output,
+so no extra project edits are needed.
+
+```
+s01_agent_loop/
+  appsettings.json          ← your local config (git-ignored)
+  appsettings.example.json  ← template, tracked in git
+  Program.cs
+  s01_agent_loop.csproj
+```
+
+The `.gitignore` excludes `appsettings.json` so you cannot accidentally
+commit your key. There are two ways to provide credentials:
+
+1. **Edit `appsettings.json`** next to the chapter you want to run
+   (easiest). Replace `PUT-YOUR-KEY-HERE` with your real key.
+2. **Set the environment variable** `DEEPSEEK_API_KEY` (or
+   `ANTHROPIC_API_KEY`) before launching the app.
+
+The same settings file is shared across all chapters. You can change
+`modelId`, `baseUrl`, `maxTokens`, `maxTokensEscalation`, and
+`fallbackModel` there.
+
+#### Switching the LLM engine
+
+The default base URL is DeepSeek's Anthropic-compatible endpoint
+(`https://api.deepseek.com/anthropic`) and the default model is
+`deepseek-v4-flash`. To use a different Anthropic-compatible provider,
+edit `appsettings.json`:
+
+```json
+{
+  "modelId": "claude-sonnet-4-6",
+  "baseUrl": "https://api.anthropic.com",
+  "apiKey": "sk-ant-..."
+}
 ```
 
 ### Web Platform
 
-The current web app still renders the legacy `docs/` s01-s12 track. Use the root-level folders for the new s01-s20 track.
+The current web app renders the legacy 12-lesson `docs/` track; the
+content has been ported to C# but the Next.js app still consumes the
+`docs/` Markdown. Use the root-level folders (`s01_*` ... `s20_*`)
+for the canonical narrative.
 
 ```sh
 cd web && npm install && npm run dev   # http://localhost:3000
@@ -390,17 +437,23 @@ learn-claude-code/
     README.md              #   Chinese source (complete narrative)
     README.en.md           #   English translation
     README.ja.md           #   Japanese translation
-    code.py                #   standalone runnable code
+    Program.cs             #   standalone runnable code (.NET 10 C#)
+    appsettings.json       #   per-chapter local config (git-ignored)
     images/                #   SVG diagrams
   s02_tool_use/
   ...
   s19_mcp_plugin/
   s20_comprehensive/       # endpoint chapter
-  agents/                  # legacy 12 runnable copies + s_full.py
+  AgentCommon/             # shared .NET 10 library (LLM client, harness, hooks,
+    AgentCommon.csproj     # tool framework, compactor, teams, cron, tasks, ...)
+    Config/  Llm/  Tools/  Hooks/  Permissions/  Compact/  Memory/
+    Skills/  Tasks/  Background/  Cron/  Teams/  Subagent/  Util/
+  appsettings.example.json # template, tracked in git
+  Directory.Build.props    # shared MSBuild conventions
+  LearnClaudeCode.slnx     # solution file (21 projects)
+  docs/                    # legacy 12-lesson docs (web app still renders these)
   skills/                  # skill files used by s07
-  docs/                    # legacy 12-lesson docs, kept during transition
-  web/                     # currently renders the legacy docs/ track
-  tests/
+  web/                     # Next.js app that renders docs/
 ```
 
 ---

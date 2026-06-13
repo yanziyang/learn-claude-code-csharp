@@ -8,26 +8,23 @@
 
 ## Problem
 
-By s11, agents can claim and complete tasks autonomously. But every task runs in one shared directory. Two agents refactoring different modules at the same time will collide: agent A edits `config.py`, agent B edits `config.py`, unstaged changes mix, and neither can roll back cleanly.
+By s11, agents can claim and complete tasks autonomously. But every task runs in one shared directory. Two agents refactoring different modules at the same time will collide: agent A edits `Config.cs`, agent B edits `Config.cs`, unstaged changes mix, and neither can roll back cleanly.
 
-The task board tracks *what to do* but has no opinion about *where to do it*. The fix: give each task its own git worktree directory. Tasks manage goals, worktrees manage execution context. Bind them by task ID.
+The task board tracks *what to do* but has no opinion about *where to do it*. The fix: give each task its own working directory. Tasks manage goals, worktrees manage execution context. Bind them by task ID.
 
 ## Solution
 
 ```
 Control plane (.tasks/)             Execution plane (.worktrees/)
 +------------------+                +------------------------+
-| task_1.json      |                | auth-refactor/         |
-|   status: in_progress  <------>   branch: wt/auth-refactor
-|   worktree: "auth-refactor"   |   task_id: 1             |
+| task_<id>.json   |                | wt_<id>/               |
+|   status: in_progress  <------>   task_id: <id>           |
+|   worktree: "wt_..."        |                             |
 +------------------+                +------------------------+
-| task_2.json      |                | ui-login/              |
-|   status: pending    <------>     branch: wt/ui-login
-|   worktree: "ui-login"       |   task_id: 2             |
+| task_<id>.json   |                | wt_<id>/               |
+|   status: pending    <------>     task_id: <id>           |
+|   worktree: "wt_..."        |                             |
 +------------------+                +------------------------+
-                                    |
-                          index.json (worktree registry)
-                          events.jsonl (lifecycle log)
 
 State machines:
   Task:     pending -> in_progress -> completed
@@ -38,62 +35,71 @@ State machines:
 
 1. **Create a task.** Persist the goal first.
 
-```python
-TASKS.create("Implement auth refactor")
-# -> .tasks/task_1.json  status=pending  worktree=""
+```csharp
+var task = store.Create("Implement auth refactor");
+// → .tasks/task_<ts>_<rand>.json  status=pending  blockedBy=[]
 ```
 
-2. **Create a worktree and bind to the task.** Passing `task_id` auto-advances the task to `in_progress`.
+2. **Create a worktree and bind to the task.** Passing `task_id` auto-advances the task to `in_progress` (`s18/Program.cs`).
 
-```python
-WORKTREES.create("auth-refactor", task_id=1)
-# -> git worktree add -b wt/auth-refactor .worktrees/auth-refactor HEAD
-# -> index.json gets new entry, task_1.json gets worktree="auth-refactor"
+```csharp
+var wtName = $"wt_auth_refactor";
+Directory.CreateDirectory(Path.Combine(worktreesDir, wtName));
+worktrees[wtName] = wtPath;
+store.Claim(task.Id, owner: wtName);   // status: pending -> in_progress
 ```
 
 The binding writes state to both sides:
 
-```python
-def bind_worktree(self, task_id, worktree):
-    task = self._load(task_id)
-    task["worktree"] = worktree
-    if task["status"] == "pending":
-        task["status"] = "in_progress"
-    self._save(task)
-```
-
-3. **Run commands in the worktree.** `cwd` points to the isolated directory.
-
-```python
-subprocess.run(command, shell=True, cwd=worktree_path,
-               capture_output=True, text=True, timeout=300)
-```
-
-4. **Close out.** Two choices:
-   - `worktree_keep(name)` -- preserve the directory for later.
-   - `worktree_remove(name, complete_task=True)` -- remove directory, complete the bound task, emit event. One call handles teardown + completion.
-
-```python
-def remove(self, name, force=False, complete_task=False):
-    self._run_git(["worktree", "remove", wt["path"]])
-    if complete_task and wt.get("task_id") is not None:
-        self.tasks.update(wt["task_id"], status="completed")
-        self.tasks.unbind_worktree(wt["task_id"])
-        self.events.emit("task.completed", ...)
-```
-
-5. **Event stream.** Every lifecycle step emits to `.worktrees/events.jsonl`:
-
-```json
+```csharp
+public (bool ok, string message) Claim(string id, string owner = "agent")
 {
-  "event": "worktree.remove.after",
-  "task": {"id": 1, "status": "completed"},
-  "worktree": {"name": "auth-refactor", "status": "removed"},
-  "ts": 1730000000
+    var task = Load(id);
+    if (task.Status != "pending")
+        return (false, $"Task {id} is {task.Status}, cannot claim");
+    if (!CanStart(task))
+        return (false, $"Blocked by: [{string.Join(", ", task.BlockedBy)}]");
+
+    task.Owner = owner;
+    task.Status = "in_progress";
+    Save(task);
+    return (true, $"Claimed {task.Id} ({task.Subject})");
 }
 ```
 
-Events emitted: `worktree.create.before/after/failed`, `worktree.remove.before/after/failed`, `worktree.keep`, `task.completed`.
+3. **Run commands in the worktree.** The teammate's `TeammateRunner` is constructed with the worktree path, so every tool call (bash, file read/write, glob) is rooted there.
+
+```csharp
+var runner = new TeammateRunner(client, config, worktreePath, bus, name, "worker",
+    onLog: msg => Console.WriteLine(msg), maxRounds: 12);
+```
+
+4. **Close out.** Two choices:
+   - `keep_worktree(name)` -- preserve the directory for later.
+   - `remove_worktree(name, complete_task=true)` -- remove directory, complete the bound task. One call handles teardown + completion.
+
+```csharp
+tools.Register("remove_worktree", "Remove an isolated working directory.",
+    SchemaBuilder.Object("Remove an isolated working directory.",
+        new Dictionary<string, (string, string, bool)>
+        {
+            ["name"]  = ("string",  "Worktree name", true),
+            ["force"] = ("boolean", "Force removal even if not empty (default false)", false),
+        }),
+    input =>
+    {
+        var name = input.GetProperty("name").GetString() ?? "";
+        if (!worktrees.TryRemove(name, out var path))
+            return $"Error: worktree '{name}' not found";
+        var force = input.TryGetProperty("force", out var f) && f.ValueKind == JsonValueKind.True;
+        if (Directory.Exists(path) && Directory.EnumerateFileSystemEntries(path).Any() && !force)
+            return $"Error: worktree '{name}' not empty; pass force=true";
+        if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        return $"Removed worktree '{name}'";
+    });
+```
+
+> **Note:** The teaching version uses plain subdirectories, not git worktrees, so the lesson works without a git repository. The production equivalent binds `.worktrees/<name>` to `git worktree add -b wt/<name> .worktrees/<name> HEAD`.
 
 After a crash, state reconstructs from `.tasks/` + `.worktrees/index.json` on disk. Conversation memory is volatile; file state is durable.
 
@@ -105,17 +111,17 @@ After a crash, state reconstructs from `.tasks/` + `.worktrees/index.json` on di
 | Execution scope    | Shared directory           | Task-scoped isolated directory               |
 | Recoverability     | Task status only           | Task status + worktree index                 |
 | Teardown           | Task completion            | Task completion + explicit keep/remove       |
-| Lifecycle visibility | Implicit in logs         | Explicit events in `.worktrees/events.jsonl` |
+| Lifecycle visibility | Implicit in logs         | Explicit `list_worktrees` / event hooks      |
 
 ## Try It
 
 ```sh
-cd learn-claude-code
-python agents/s12_worktree_task_isolation.py
+cd learn-claude-code-csharp
+dotnet run --project s18_worktree_isolation
 ```
 
 1. `Create tasks for backend auth and frontend login page, then list tasks.`
 2. `Create worktree "auth-refactor" for task 1, then bind task 2 to a new worktree "ui-login".`
 3. `Run "git status --short" in worktree "auth-refactor".`
-4. `Keep worktree "ui-login", then list worktrees and inspect events.`
-5. `Remove worktree "auth-refactor" with complete_task=true, then list tasks/worktrees/events.`
+4. `Keep worktree "ui-login", then list worktrees.`
+5. `Remove worktree "auth-refactor" with force=true, then list tasks and worktrees.`

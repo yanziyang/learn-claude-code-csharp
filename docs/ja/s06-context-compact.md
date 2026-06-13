@@ -2,17 +2,17 @@
 
 `s01 > s02 > s03 > s04 > s05 > [ s06 ] | s07 > s08 > s09 > s10 > s11 > s12`
 
-> *"コンテキストはいつか溢れる、空ける手段が要る"* -- 3層圧縮で無限セッションを実現。
+> *"コンテキストはいつか溢れる、空ける手段が要る"* -- 4層圧縮で無限セッションを実現。
 >
 > **Harness 層**: 圧縮 -- クリーンな記憶、無限のセッション。
 
 ## 問題
 
-コンテキストウィンドウは有限だ。1000行のファイルに対する`read_file`1回で約4000トークンを消費する。30ファイルを読み20回のbashコマンドを実行すると、100,000トークン超。圧縮なしでは、エージェントは大規模コードベースで作業できない。
+コンテキストウィンドウは有限だ。1000行のファイルに対する `read_file` 1回で約4000トークンを消費する。30ファイルを読み20回のbashコマンドを実行すると、100,000トークン超。圧縮なしでは、エージェントは大規模コードベースで作業できない。
 
 ## 解決策
 
-積極性を段階的に上げる3層構成:
+積極性を段階的に上げる4層構成 (`AgentCommon/Compact/ContextCompactor.cs`):
 
 ```
 Every turn:
@@ -21,9 +21,17 @@ Every turn:
 +------------------+
         |
         v
-[Layer 1: micro_compact]        (silent, every turn)
-  Replace tool_result > 3 turns old
-  with "[Previous: used {tool_name}]"
+[L3: ToolResultBudget]    (silent, every turn)
+  Persist large tool_results to .task_outputs/tool-results/
+  Replace in-context copy with a placeholder + file path
+        |
+        v
+[L1: SnipCompact]         (silent, every turn)
+  Drop middle messages when count > 50
+        |
+        v
+[L2: MicroCompact]        (silent, every turn)
+  Replace tool_result > 3 turns old with "[Previous: used {tool_name}]"
         |
         v
 [Check: tokens > 50000?]
@@ -31,73 +39,81 @@ Every turn:
    no              yes
    |               |
    v               v
-continue    [Layer 2: auto_compact]
-              Save transcript to .transcripts/
-              LLM summarizes conversation.
-              Replace all messages with [summary].
-                    |
-                    v
-            [Layer 3: compact tool]
-              Model calls compact explicitly.
-              Same summarization as auto_compact.
+continue    [L4: CompactHistory]
+            Save transcript to .transcripts/
+            LLM summarizes conversation.
+            Replace all messages with [summary] + tail.
 ```
 
 ## 仕組み
 
-1. **第1層 -- micro_compact**: 各LLM呼び出しの前に、古いツール結果をプレースホルダーに置換する。
+1. **L3 -- ToolResultBudget**: 大きすぎる tool_result をディスクへ退避し、コンテキスト内のコピーはプレースホルダに置き換える。
 
-```python
-def micro_compact(messages: list) -> list:
-    tool_results = []
-    for i, msg in enumerate(messages):
-        if msg["role"] == "user" and isinstance(msg.get("content"), list):
-            for j, part in enumerate(msg["content"]):
-                if isinstance(part, dict) and part.get("type") == "tool_result":
-                    tool_results.append((i, j, part))
-    if len(tool_results) <= KEEP_RECENT:
-        return messages
-    for _, _, part in tool_results[:-KEEP_RECENT]:
-        if len(part.get("content", "")) > 100:
-            part["content"] = f"[Previous: used {tool_name}]"
-    return messages
+```csharp
+private void ToolResultBudget(List<Message> messages)
+{
+    var last = messages[^1];
+    if (last.Role != "user") return;
+    var blocks = last.Content.OfType<ToolResultBlock>().ToList();
+    if (blocks.Count == 0) return;
+
+    long total = blocks.Sum(b => b.Content?.Length ?? 0);
+    if (total <= _toolResultBudgetBytes) return;
+
+    var ranked = blocks.OrderByDescending(b => b.Content?.Length ?? 0).ToList();
+    foreach (var block in ranked)
+    {
+        if (total <= _toolResultBudgetBytes) break;
+        var path = PersistToDisk(block.Content);   // .task_outputs/ に書き出し
+        block.Content = $"[See {path} for full output]";
+        total -= block.Content.Length;
+    }
+}
 ```
 
-2. **第2層 -- auto_compact**: トークンが閾値を超えたら、完全なトランスクリプトをディスクに保存し、LLMに要約を依頼する。
+2. **L1 + L2 -- Snip + MicroCompact**: 各LLM呼び出しの前に実行。
 
-```python
-def auto_compact(messages: list) -> list:
-    # Save transcript for recovery
-    transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
-    with open(transcript_path, "w") as f:
-        for msg in messages:
-            f.write(json.dumps(msg, default=str) + "\n")
-    # LLM summarizes
-    response = client.messages.create(
-        model=MODEL,
-        messages=[{"role": "user", "content":
-            "Summarize this conversation for continuity..."
-            + json.dumps(messages, default=str)[:80000]}],
-        max_tokens=2000,
-    )
-    return [
-        {"role": "user", "content": f"[Compressed]\n\n{response.content[0].text}"},
-    ]
+```csharp
+public void PrepareBeforeLlm(List<Message> messages)
+{
+    ToolResultBudget(messages);
+    SnipCompact(messages);    // count > maxMessages なら中身を切り詰め
+    MicroCompact(messages);   // 古い tool_result をプレースホルダに
+}
 ```
 
-3. **第3層 -- manual compact**: `compact`ツールが同じ要約処理をオンデマンドでトリガーする。
+3. **L4 -- CompactHistory**: モデルが `prompt_too_long` を返したら、完全なトランスクリプトをディスクへ保存し、LLMに要約を依頼する。
 
-4. ループが3層すべてを統合する:
+```csharp
+public async Task<List<Message>> EmergencyAsync(List<Message> messages, CancellationToken ct = default)
+{
+    var transcriptPath = WriteTranscript(messages);
+    _onLog?.Invoke($"[transcript saved: {transcriptPath}]");
+    var summary = await SummarizeHistoryAsync(messages, ct);
 
-```python
-def agent_loop(messages: list):
-    while True:
-        micro_compact(messages)                        # Layer 1
-        if estimate_tokens(messages) > THRESHOLD:
-            messages[:] = auto_compact(messages)       # Layer 2
-        response = client.messages.create(...)
-        # ... tool execution ...
-        if manual_compact:
-            messages[:] = auto_compact(messages)       # Layer 3
+    var tailStart = Math.Max(0, messages.Count - 5);
+    return new List<Message> { Message.UserText($"[Reactive compact]\n\n{summary}") }
+        .Concat(messages.Skip(tailStart))
+        .ToList();
+}
+```
+
+4. ループが4層すべてを `AgentHarness.RunAsync` 経由で自動統合する。
+
+```csharp
+// AgentHarness.RunAsync 内 — 各反復で呼ばれる:
+Compactor.PrepareBeforeLlm(messages);
+
+try
+{
+    response = await Client.CreateMessageAsync(systemPrompt, messages, ...);
+}
+catch (InvalidOperationException ex) when (IsPromptTooLong(ex))
+{
+    messages.Clear();
+    messages.AddRange(await Compactor.EmergencyAsync(messages, ct));
+    response = await Client.CreateMessageAsync(systemPrompt, messages, ...);
+}
 ```
 
 トランスクリプトがディスク上に完全な履歴を保持する。何も真に失われず、アクティブなコンテキストの外に移動されるだけ。
@@ -106,19 +122,19 @@ def agent_loop(messages: list):
 
 | Component      | Before (s05)     | After (s06)                |
 |----------------|------------------|----------------------------|
-| Tools          | 5                | 5 (base + compact)         |
-| Context mgmt   | None             | Three-layer compression    |
+| Tools          | 5                | 5 (unchanged)              |
+| Context mgmt   | None             | Four-layer compression     |
 | Micro-compact  | None             | Old results -> placeholders|
-| Auto-compact   | None             | Token threshold trigger    |
+| Auto-compact   | None             | Reactive path on overflow  |
 | Transcripts    | None             | Saved to .transcripts/     |
 
 ## 試してみる
 
 ```sh
-cd learn-claude-code
-python agents/s06_context_compact.py
+cd learn-claude-code-csharp
+dotnet run --project s08_context_compact
 ```
 
-1. `Read every Python file in the agents/ directory one by one` (micro-compactが古い結果を置換するのを観察する)
+1. `Read every C# file in the AgentCommon/ directory one by one` (L2 micro-compact が古い結果を置換するのを観察)
 2. `Keep reading files until compression triggers automatically`
-3. `Use the compact tool to manually compress the conversation`
+3. `Force a long context to overflow and observe the L4 reactive compact`

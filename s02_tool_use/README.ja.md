@@ -136,7 +136,7 @@ for block in response.content:
 
 ```sh
 cd learn-claude-code
-python s02_tool_use/code.py
+dotnet run --project s02_tool_use
 ```
 
 以下のプロンプトを試してみよう：
@@ -144,7 +144,7 @@ python s02_tool_use/code.py
 1. `Read the file README.md and tell me what this project is about`
 2. `Create a file called test.py that prints "hello", then read it back`
 3. `Find all Python files in this directory`
-4. `Read both README.md and requirements.txt, then create a summary file`
+4. `Read both README.md and Program.cs, then create a summary file`
 
 観察のポイント：モデルがツールを一つだけ呼び出すときと、複数同時に呼び出すときの違い。複数のツール呼び出しは正しい順序で実行されているか？
 

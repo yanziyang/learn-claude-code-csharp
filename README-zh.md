@@ -206,61 +206,40 @@ Claude Code = 一个 agent loop
 
 ## 核心模式
 
-```python
-def agent_loop(messages):
-    while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM,
-            messages=messages, tools=TOOLS,
-        )
-        messages.append({"role": "assistant",
-                         "content": response.content})
+C# 版的循环实现在 `AgentCommon/Agent/AgentHarness.cs`，是每个 `Program.cs` 最终调用的入口。循环本身始终不变。机制属于 harness。
 
-        if response.stop_reason != "tool_use":
-            return
+```csharp
+public async Task<LlmResponse> RunAsync(List<Message> messages, CancellationToken ct = default)
+{
+    Hooks.FireBeforeLlmCall(messages);
+    Compactor.PrepareBeforeLlm(messages);
 
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                output = TOOL_HANDLERS[block.name](**block.input)
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": output,
-                })
-        messages.append({"role": "user", "content": results})
+    var systemPrompt = SystemPromptProvider?.Invoke() ?? "";
+    var response = await Client.CreateMessageAsync(
+        systemPrompt, messages, Tools.AllSpecs().ToList(), ct: ct);
+    messages.Add(Message.Assistant(response.Content));
+
+    if (response.StopReason != "tool_use")
+        return response;
+
+    var results = new List<ToolResultBlock>();
+    foreach (var block in response.Content.OfType<ToolUseBlock>())
+    {
+        var output = Tools.Invoke(block.Name, block.Input);
+        results.Add(new ToolResultBlock(block.Id, output));
+    }
+    messages.Add(Message.UserToolResults(results));
+    return response;
+}
 ```
 
 每个课程在这个循环之上叠加一个 harness 机制 -- 循环本身始终不变。循环属于 agent。机制属于 harness。
 
 ## 版本说明
 
-本仓库现在同时保留两条教程线：
+本仓库目前只保留 20 章主线（根目录 `s01-s20`）。每章包含完整叙事 README、英文/日文译本、可运行的 .NET 10 C# `Program.cs` 和必要的图示，全部共享 `AgentCommon/` 类库。
 
-- **新版主线：根目录 `s01-s20`**
-  根目录下的 `s01_*` 到 `s20_*` 是新的主版本，也是当前推荐阅读路径。每章包含完整叙事 README、英文/日文译本、可运行的 `code.py`，以及必要的图示。
-- **旧版过渡：`docs/`、`agents/`、当前 `web/`**
-  这些仍保留旧 12 章体系，暂时用于已有读者、旧链接和 Web 平台过渡。
-
-新读者请从根目录 `s01_agent_loop/` 读到 `s20_comprehensive/`。如果你是从旧链接或当前 Web 平台进入，大概率看到的是旧 12 章版本。旧版章节号和新版不完全一致，不要混用章节号。
-
-### 旧版到新版的对应关系
-
-| 旧 12 章版本 | 新 20 章版本 | 主题 |
-|---|---|---|
-| 旧 s01 | 新 s01 | Agent Loop |
-| 旧 s02 | 新 s02 | Tool Use |
-| 旧 s03 | 新 s05 | TodoWrite |
-| 旧 s04 | 新 s06 | Subagent |
-| 旧 s05 | 新 s07 | Skill Loading |
-| 旧 s06 | 新 s08 | Context Compact |
-| 旧 s07 | 新 s12 | Task System |
-| 旧 s08 | 新 s13 | Background Tasks |
-| 旧 s09 | 新 s15 | Agent Teams |
-| 旧 s10 | 新 s16 | Team Protocols |
-| 旧 s11 | 新 s17 | Autonomous Agents |
-| 旧 s12 | 新 s18 | Worktree Isolation |
-| 新版新增 | s03、s04、s09、s10、s11、s14、s19、s20 | Permission、Hooks、Memory、System Prompt、Error Recovery、Cron、MCP、Comprehensive Agent |
+旧 12 章体系下的 `docs/` 目录和 `web/` 应用仍保留（内容已转为 C#，但 Next.js 应用仍读取 `docs/` 的 Markdown）。旧代码文件（`agents/`、`sNN_*/code.py`、`tests/`）已删除。
 
 ## 范围说明 (重要)
 
@@ -277,30 +256,40 @@ def agent_loop(messages):
 
 ## 快速开始
 
-### 新版 20 章主线
+### 20 章主线（.NET 10 / C#）
 
 ```sh
-git clone https://github.com/shareAI-lab/learn-claude-code
-cd learn-claude-code
-pip install -r requirements.txt
-cp .env.example .env   # 编辑 .env 填入你的 ANTHROPIC_API_KEY
+git clone https://github.com/shareAI-lab/learn-claude-code-csharp
+cd learn-claude-code-csharp
+dotnet build                                                # 还原 + 编译整个 solution
 
-python s01_agent_loop/code.py        # 起点 — 一个循环 + bash
-python s08_context_compact/code.py    # 上下文压缩（复杂章）
-python s20_comprehensive/code.py      # 终点章: 全部机制归到一个循环
+# 配置 API key（一次性）
+cp s01_agent_loop/appsettings.example.json s01_agent_loop/appsettings.json
+# 编辑 s01_agent_loop/appsettings.json，把 PUT-YOUR-KEY-HERE 替换成你的 DeepSeek API key
+# 跑其他章节同理；也可以设环境变量 DEEPSEEK_API_KEY=sk-...
+
+dotnet run --project s01_agent_loop         # 起点 — 一个循环 + bash
+dotnet run --project s08_context_compact    # 上下文压缩（复杂章）
+dotnet run --project s20_comprehensive      # 终点章: 全部机制归到一个循环
 ```
 
-### 旧版 12 章过渡线
+#### 切换 LLM 引擎
 
-```sh
-python agents/s01_agent_loop.py
-python agents/s12_worktree_task_isolation.py
-python agents/s_full.py
+默认 base URL 是 DeepSeek 的 Anthropic 兼容端点
+`https://api.deepseek.com/anthropic`，默认 model 是 `deepseek-v4-flash`。
+要换其他 Anthropic 兼容供应商，编辑 `appsettings.json`：
+
+```json
+{
+  "modelId": "claude-sonnet-4-6",
+  "baseUrl": "https://api.anthropic.com",
+  "apiKey": "sk-ant-..."
+}
 ```
 
 ### Web 平台
 
-当前 Web 平台仍读取 `docs/` 中的旧 12 章内容。新版 20 章请直接阅读根目录 `s01-s20`。
+当前 Web 平台仍读取 `docs/` 中的旧 12 章内容（已转为 C#）。新版 20 章请直接阅读根目录 `s01-s20`。
 
 ```sh
 cd web && npm install && npm run dev   # http://localhost:3000
@@ -387,17 +376,22 @@ learn-claude-code/
     README.md              #   中文源文档（完整叙事）
     README.en.md           #   英文译本
     README.ja.md           #   日文译本
-    code.py                #   独立可运行代码
+    Program.cs             #   独立可运行代码（.NET 10 C#）
     images/                #   SVG 流程图
   s02_tool_use/
   ...
   s19_mcp_plugin/
   s20_comprehensive/       # 终点章
-  agents/                  # 旧 12 章可运行副本 + s_full.py
+  AgentCommon/             # 共享 .NET 10 类库（LLM 客户端、harness、hooks、...）
+    AgentCommon.csproj
+    Config/  Llm/  Tools/  Hooks/  Permissions/  Compact/  Memory/
+    Skills/  Tasks/  Background/  Cron/  Teams/  Subagent/  Util/
+  appsettings.example.json # 模板，纳入 git
+  Directory.Build.props    # 共享 MSBuild 配置
+  LearnClaudeCode.slnx     # solution 文件（21 个 project）
+  docs/                    # 旧 12 章文档（web 应用仍读取）
   skills/                  # s07 使用的 skill 文件
-  docs/                    # 旧 12 章文档，过渡期保留
-  web/                     # 当前仍基于 docs/ 旧版内容生成
-  tests/
+  web/                     # Next.js 应用，渲染 docs/ 内容
 ```
 
 ## 学完之后 -- 从理解到落地

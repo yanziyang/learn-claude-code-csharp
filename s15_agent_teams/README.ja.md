@@ -155,7 +155,7 @@ if inbox:
 
 ```sh
 cd learn-claude-code
-python s15_agent_teams/code.py
+dotnet run --project s15_agent_teams
 ```
 
 以下のプロンプトを試してください：

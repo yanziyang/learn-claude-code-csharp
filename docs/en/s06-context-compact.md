@@ -2,7 +2,7 @@
 
 `s01 > s02 > s03 > s04 > s05 > [ s06 ] | s07 > s08 > s09 > s10 > s11 > s12`
 
-> *"Context will fill up; you need a way to make room"* -- three-layer compression strategy for infinite sessions.
+> *"Context will fill up; you need a way to make room"* -- four-layer compression strategy for infinite sessions.
 >
 > **Harness layer**: Compression -- clean memory for infinite sessions.
 
@@ -12,7 +12,7 @@ The context window is finite. A single `read_file` on a 1000-line file costs ~40
 
 ## Solution
 
-Three layers, increasing in aggressiveness:
+Four layers, increasing in aggressiveness (`AgentCommon/Compact/ContextCompactor.cs`):
 
 ```
 Every turn:
@@ -21,9 +21,17 @@ Every turn:
 +------------------+
         |
         v
-[Layer 1: micro_compact]        (silent, every turn)
-  Replace tool_result > 3 turns old
-  with "[Previous: used {tool_name}]"
+[L3: ToolResultBudget]    (silent, every turn)
+  Persist large tool_results to .task_outputs/tool-results/
+  Replace in-context copy with a placeholder + file path
+        |
+        v
+[L1: SnipCompact]         (silent, every turn)
+  Drop middle messages when count > 50
+        |
+        v
+[L2: MicroCompact]        (silent, every turn)
+  Replace tool_result > 3 turns old with "[Previous: used {tool_name}]"
         |
         v
 [Check: tokens > 50000?]
@@ -31,73 +39,81 @@ Every turn:
    no              yes
    |               |
    v               v
-continue    [Layer 2: auto_compact]
-              Save transcript to .transcripts/
-              LLM summarizes conversation.
-              Replace all messages with [summary].
-                    |
-                    v
-            [Layer 3: compact tool]
-              Model calls compact explicitly.
-              Same summarization as auto_compact.
+continue    [L4: CompactHistory]
+            Save transcript to .transcripts/
+            LLM summarizes conversation.
+            Replace all messages with [summary] + tail.
 ```
 
 ## How It Works
 
-1. **Layer 1 -- micro_compact**: Before each LLM call, replace old tool results with placeholders.
+1. **L3 -- ToolResultBudget**: Persist oversized tool results to disk, replace in-context with a placeholder.
 
-```python
-def micro_compact(messages: list) -> list:
-    tool_results = []
-    for i, msg in enumerate(messages):
-        if msg["role"] == "user" and isinstance(msg.get("content"), list):
-            for j, part in enumerate(msg["content"]):
-                if isinstance(part, dict) and part.get("type") == "tool_result":
-                    tool_results.append((i, j, part))
-    if len(tool_results) <= KEEP_RECENT:
-        return messages
-    for _, _, part in tool_results[:-KEEP_RECENT]:
-        if len(part.get("content", "")) > 100:
-            part["content"] = f"[Previous: used {tool_name}]"
-    return messages
+```csharp
+private void ToolResultBudget(List<Message> messages)
+{
+    var last = messages[^1];
+    if (last.Role != "user") return;
+    var blocks = last.Content.OfType<ToolResultBlock>().ToList();
+    if (blocks.Count == 0) return;
+
+    long total = blocks.Sum(b => b.Content?.Length ?? 0);
+    if (total <= _toolResultBudgetBytes) return;
+
+    var ranked = blocks.OrderByDescending(b => b.Content?.Length ?? 0).ToList();
+    foreach (var block in ranked)
+    {
+        if (total <= _toolResultBudgetBytes) break;
+        var path = PersistToDisk(block.Content);   // write to .task_outputs/
+        block.Content = $"[See {path} for full output]";
+        total -= block.Content.Length;
+    }
+}
 ```
 
-2. **Layer 2 -- auto_compact**: When tokens exceed threshold, save full transcript to disk, then ask the LLM to summarize.
+2. **L1 + L2 -- Snip + MicroCompact**: Run before each LLM call.
 
-```python
-def auto_compact(messages: list) -> list:
-    # Save transcript for recovery
-    transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
-    with open(transcript_path, "w") as f:
-        for msg in messages:
-            f.write(json.dumps(msg, default=str) + "\n")
-    # LLM summarizes
-    response = client.messages.create(
-        model=MODEL,
-        messages=[{"role": "user", "content":
-            "Summarize this conversation for continuity..."
-            + json.dumps(messages, default=str)[:80000]}],
-        max_tokens=2000,
-    )
-    return [
-        {"role": "user", "content": f"[Compressed]\n\n{response.content[0].text}"},
-    ]
+```csharp
+public void PrepareBeforeLlm(List<Message> messages)
+{
+    ToolResultBudget(messages);
+    SnipCompact(messages);    // drop middle when count > maxMessages
+    MicroCompact(messages);   // replace old tool_results with placeholders
+}
 ```
 
-3. **Layer 3 -- manual compact**: The `compact` tool triggers the same summarization on demand.
+3. **L4 -- CompactHistory**: When the model reports `prompt_too_long`, save the full transcript to disk and ask the LLM to summarize.
 
-4. The loop integrates all three:
+```csharp
+public async Task<List<Message>> EmergencyAsync(List<Message> messages, CancellationToken ct = default)
+{
+    var transcriptPath = WriteTranscript(messages);
+    _onLog?.Invoke($"[transcript saved: {transcriptPath}]");
+    var summary = await SummarizeHistoryAsync(messages, ct);
 
-```python
-def agent_loop(messages: list):
-    while True:
-        micro_compact(messages)                        # Layer 1
-        if estimate_tokens(messages) > THRESHOLD:
-            messages[:] = auto_compact(messages)       # Layer 2
-        response = client.messages.create(...)
-        # ... tool execution ...
-        if manual_compact:
-            messages[:] = auto_compact(messages)       # Layer 3
+    var tailStart = Math.Max(0, messages.Count - 5);
+    return new List<Message> { Message.UserText($"[Reactive compact]\n\n{summary}") }
+        .Concat(messages.Skip(tailStart))
+        .ToList();
+}
+```
+
+4. The loop integrates all four layers automatically through `AgentHarness.RunAsync`.
+
+```csharp
+// In AgentHarness.RunAsync — called every iteration:
+Compactor.PrepareBeforeLlm(messages);
+
+try
+{
+    response = await Client.CreateMessageAsync(systemPrompt, messages, ...);
+}
+catch (InvalidOperationException ex) when (IsPromptTooLong(ex))
+{
+    messages.Clear();
+    messages.AddRange(await Compactor.EmergencyAsync(messages, ct));
+    response = await Client.CreateMessageAsync(systemPrompt, messages, ...);
+}
 ```
 
 Transcripts preserve full history on disk. Nothing is truly lost -- just moved out of active context.
@@ -106,19 +122,19 @@ Transcripts preserve full history on disk. Nothing is truly lost -- just moved o
 
 | Component      | Before (s05)     | After (s06)                |
 |----------------|------------------|----------------------------|
-| Tools          | 5                | 5 (base + compact)         |
-| Context mgmt   | None             | Three-layer compression    |
+| Tools          | 5                | 5 (unchanged)              |
+| Context mgmt   | None             | Four-layer compression     |
 | Micro-compact  | None             | Old results -> placeholders|
-| Auto-compact   | None             | Token threshold trigger    |
+| Auto-compact   | None             | Reactive path on overflow  |
 | Transcripts    | None             | Saved to .transcripts/     |
 
 ## Try It
 
 ```sh
-cd learn-claude-code
-python agents/s06_context_compact.py
+cd learn-claude-code-csharp
+dotnet run --project s08_context_compact
 ```
 
-1. `Read every Python file in the agents/ directory one by one` (watch micro-compact replace old results)
+1. `Read every C# file in the AgentCommon/ directory one by one` (watch L2 micro-compact replace old results)
 2. `Keep reading files until compression triggers automatically`
-3. `Use the compact tool to manually compress the conversation`
+3. `Force a long context to overflow and observe the L4 reactive compact`

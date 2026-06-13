@@ -22,7 +22,7 @@
                     +----------------+
                           |
               +-----------+-----------+
-              | TodoManager state     |
+              | TodoState              |
               | [ ] task A            |
               | [>] task B  <- doing  |
               | [x] task C            |
@@ -34,63 +34,75 @@
 
 ## 仕組み
 
-1. TodoManagerはアイテムのリストをステータス付きで保持する。`in_progress`にできるのは同時に1つだけ。
+1. `TodoState` はアイテムのリストをステータス付きで保持する。`in_progress` にできるのは同時に1つだけ。
 
-```python
-class TodoManager:
-    def update(self, items: list) -> str:
-        validated, in_progress_count = [], 0
-        for item in items:
-            status = item.get("status", "pending")
-            if status == "in_progress":
-                in_progress_count += 1
-            validated.append({"id": item["id"], "text": item["text"],
-                              "status": status})
-        if in_progress_count > 1:
-            raise ValueError("Only one task can be in_progress")
-        self.items = validated
-        return self.render()
-```
+```csharp
+public sealed class TodoState
+{
+    public List<TodoItem> Items { get; private set; } = new();
+    public event Action? Changed;
 
-2. `todo`ツールは他のツールと同様にディスパッチマップに追加される。
+    public void Update(List<TodoItem> items)
+    {
+        Items = items;
+        Changed?.Invoke();
+    }
 
-```python
-TOOL_HANDLERS = {
-    # ...base tools...
-    "todo": lambda **kw: TODO.update(kw["items"]),
+    public void Render()
+    {
+        Console.WriteLine("\n## Current Tasks");
+        foreach (var t in Items)
+        {
+            var icon = t.status switch
+            {
+                "completed"   => "x",
+                "in_progress" => ">",
+                _             => " ",
+            };
+            Console.WriteLine($"  [{icon}] {t.content}");
+        }
+    }
 }
 ```
 
-3. nagリマインダーが、モデルが3ラウンド以上`todo`を呼ばなかった場合にナッジを注入する。
+2. `todo_write` ツールは他のツールと同様に登録される。
 
-```python
-if rounds_since_todo >= 3 and messages:
-    last = messages[-1]
-    if last["role"] == "user" and isinstance(last.get("content"), list):
-        last["content"].insert(0, {
-            "type": "text",
-            "text": "<reminder>Update your todos.</reminder>",
-        })
+```csharp
+var todos = new TodoTools.TodoState();
+TodoTools.Register(tools, todos);
 ```
 
-「一度にin_progressは1つだけ」の制約が逐次的な集中を強制し、nagリマインダーが説明責任を生む。
+3. 更新後、レンダリング結果がモデル自身にも見えるよう `tool_result` として返る。
+
+```csharp
+tools.Register("todo_write", "Create and manage a task list for your current coding session.",
+    /* schema */, input =>
+    {
+        var items = ParseTodos(input);
+        state.Update(items);
+        state.Render();      // 同じビューをモデル側にもミラー
+        return $"Updated {items.Count} tasks";
+    });
+```
+
+「一度に in_progress は1つだけ」の制約が逐次的な集中を強制する。レンダリング結果をコンテキストにミラーすることで説明責任が生まれる。
 
 ## s02からの変更点
 
 | Component      | Before (s02)     | After (s03)                |
 |----------------|------------------|----------------------------|
-| Tools          | 4                | 5 (+todo)                  |
-| Planning       | None             | TodoManager with statuses  |
-| Nag injection  | None             | `<reminder>` after 3 rounds|
-| Agent loop     | Simple dispatch  | + rounds_since_todo counter|
+| Tools          | 4                | 5 (+todo_write)            |
+| Planning       | None             | `TodoState` with statuses  |
+| Mirror         | None             | レンダリング結果を result に|
+| Agent loop     | Simple dispatch  | Unchanged                  |
 
 ## 試してみる
 
 ```sh
-cd learn-claude-code
-python agents/s03_todo_write.py
+cd learn-claude-code-csharp
+dotnet run --project s05_todo_write
 ```
 
-1. `Refactor the file hello.py: add type hints, docstrings, and a main guard`
-2. `Create a Python package with __init__.py, utils.py, and tests/test_utils.py`
-3. `Review all Python files and fix any style issues`
+1. `Refactor the file hello.cs: add XML doc comments and a main guard`
+2. `Create a small class library with Class1.cs, Utils.cs, and tests/UtilsTests.cs`
+3. `Review all C# files in this project and fix any obvious style issues`

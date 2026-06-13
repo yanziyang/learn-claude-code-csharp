@@ -201,7 +201,7 @@ LLM が非 tool_use を返す
 
 ```sh
 cd learn-claude-code
-python s16_team_protocols/code.py
+dotnet run --project s16_team_protocols
 ```
 
 以下のプロンプトを試してください：

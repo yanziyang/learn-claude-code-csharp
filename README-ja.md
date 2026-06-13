@@ -206,61 +206,40 @@ Claude Code = 一つの agent loop
 
 ## コアパターン
 
-```python
-def agent_loop(messages):
-    while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM,
-            messages=messages, tools=TOOLS,
-        )
-        messages.append({"role": "assistant",
-                         "content": response.content})
+C# 版のループは `AgentCommon/Agent/AgentHarness.cs` にあり、各 `Program.cs` が最終的に呼び出すエントリポイントである。ループ自体は変わらない。メカニズムは Harness のもの。
 
-        if response.stop_reason != "tool_use":
-            return
+```csharp
+public async Task<LlmResponse> RunAsync(List<Message> messages, CancellationToken ct = default)
+{
+    Hooks.FireBeforeLlmCall(messages);
+    Compactor.PrepareBeforeLlm(messages);
 
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                output = TOOL_HANDLERS[block.name](**block.input)
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": output,
-                })
-        messages.append({"role": "user", "content": results})
+    var systemPrompt = SystemPromptProvider?.Invoke() ?? "";
+    var response = await Client.CreateMessageAsync(
+        systemPrompt, messages, Tools.AllSpecs().ToList(), ct: ct);
+    messages.Add(Message.Assistant(response.Content));
+
+    if (response.StopReason != "tool_use")
+        return response;
+
+    var results = new List<ToolResultBlock>();
+    foreach (var block in response.Content.OfType<ToolUseBlock>())
+    {
+        var output = Tools.Invoke(block.Name, block.Input);
+        results.Add(new ToolResultBlock(block.Id, output));
+    }
+    messages.Add(Message.UserToolResults(results));
+    return response;
+}
 ```
 
 各セッションはこのループの上に 1 つの Harness メカニズムを重ねる -- ループ自体は変わらない。ループは Agent のもの。メカニズムは Harness のもの。
 
 ## バージョン状況
 
-このリポジトリには現在、2 つのチュートリアルトラックが共存している：
+本リポジトリは現行の 20 セッション版のみを収録している（ルート直下の `s01-s20`）。各セッションには中国語原文、英語/日本語訳、実行可能な .NET 10 C# `Program.cs`、必要に応じた図が含まれ、すべて `AgentCommon/` クラスライブラリを共有する。
 
-- **現行トラック：ルート直下の `s01-s20`**
-  ルート直下の `s01_*` から `s20_*` までが新しい正規版であり、現在推奨する読書経路。各セッションには中国語原文、英語/日本語訳、実行可能な `code.py`、必要に応じた図が含まれる。
-- **旧版移行トラック：`docs/`、`agents/`、現在の `web/`**
-  これらは旧 12 セッション版を保持している。既存読者、旧リンク、Web プラットフォームのために移行期間中は一時的に残している。
-
-新しく読む場合は、ルート直下の `s01_agent_loop/` から `s20_comprehensive/` までを読む。旧リンクや現在の Web アプリから入った場合は、旧 12 セッション版を読んでいる可能性が高い。旧版と現行版のセッション番号は常に一致しないため、番号を混同しないこと。
-
-### 旧版から現行版への対応
-
-| 旧 12 セッション版 | 現行 20 セッション版 | トピック |
-|---|---|---|
-| 旧 s01 | 現行 s01 | Agent Loop |
-| 旧 s02 | 現行 s02 | Tool Use |
-| 旧 s03 | 現行 s05 | TodoWrite |
-| 旧 s04 | 現行 s06 | Subagent |
-| 旧 s05 | 現行 s07 | Skill Loading |
-| 旧 s06 | 現行 s08 | Context Compact |
-| 旧 s07 | 現行 s12 | Task System |
-| 旧 s08 | 現行 s13 | Background Tasks |
-| 旧 s09 | 現行 s15 | Agent Teams |
-| 旧 s10 | 現行 s16 | Team Protocols |
-| 旧 s11 | 現行 s17 | Autonomous Agents |
-| 旧 s12 | 現行 s18 | Worktree Isolation |
-| 現行版のみ | s03、s04、s09、s10、s11、s14、s19、s20 | Permission、Hooks、Memory、System Prompt、Error Recovery、Cron、MCP、Comprehensive Agent |
+旧 12 セッション版の `docs/` ディレクトリと `web/` アプリケーションは引き続き保持されている（内容は C# に変換済みだが、Next.js アプリは `docs/` の Markdown を依然として読む）。旧コードファイル（`agents/`、`sNN_*/code.py`、`tests/`）は削除済み。
 
 ## スコープ (重要)
 
@@ -277,30 +256,40 @@ def agent_loop(messages):
 
 ## クイックスタート
 
-### 現行 20 セッション版
+### 20 セッション版 (.NET 10 / C#)
 
 ```sh
-git clone https://github.com/shareAI-lab/learn-claude-code
-cd learn-claude-code
-pip install -r requirements.txt
-cp .env.example .env   # .env を編集して ANTHROPIC_API_KEY を入力
+git clone https://github.com/shareAI-lab/learn-claude-code-csharp
+cd learn-claude-code-csharp
+dotnet build                                                # リストア + ソリューション全体のビルド
 
-python s01_agent_loop/code.py        # ここから開始 — 1ループ + bash
-python s08_context_compact/code.py    # コンテキスト圧縮（複雑章）
-python s20_comprehensive/code.py      # 終点: 全メカニズムを 1 つのループへ
+# API キーの設定（初回のみ）
+cp s01_agent_loop/appsettings.example.json s01_agent_loop/appsettings.json
+# s01_agent_loop/appsettings.json を編集し、PUT-YOUR-KEY-HERE を DeepSeek の API キーに置き換える
+# 他の章も同様。環境変数 DEEPSEEK_API_KEY=sk-... を設定する方法もある
+
+dotnet run --project s01_agent_loop         # ここから開始 — 1ループ + bash
+dotnet run --project s08_context_compact    # コンテキスト圧縮（複雑章）
+dotnet run --project s20_comprehensive      # 終点: 全メカニズムを 1 つのループへ
 ```
 
-### 旧 12 セッション移行版
+#### LLM エンジンの切り替え
 
-```sh
-python agents/s01_agent_loop.py
-python agents/s12_worktree_task_isolation.py
-python agents/s_full.py
+デフォルトの base URL は DeepSeek の Anthropic 互換エンドポイント
+`https://api.deepseek.com/anthropic`、デフォルト model は `deepseek-v4-flash`。
+別の Anthropic 互換プロバイダを使う場合は `appsettings.json` を編集する：
+
+```json
+{
+  "modelId": "claude-sonnet-4-6",
+  "baseUrl": "https://api.anthropic.com",
+  "apiKey": "sk-ant-..."
+}
 ```
 
 ### Web プラットフォーム
 
-現在の Web プラットフォームはまだ `docs/` の旧 12 セッション版を表示する。現行 20 セッション版はルート直下の `s01-s20` を読む。
+現在の Web プラットフォームはまだ `docs/` の旧 12 セッション版を表示する（内容は C# に変換済み）。現行 20 セッション版はルート直下の `s01-s20` を読む。
 
 ```sh
 cd web && npm install && npm run dev   # http://localhost:3000
@@ -386,17 +375,22 @@ learn-claude-code/
     README.md              #   中国語ソース（完全なナラティブ）
     README.en.md           #   英語訳
     README.ja.md           #   日本語訳
-    code.py                #   単体実行可能なコード
+    Program.cs             #   単体実行可能なコード（.NET 10 C#）
     images/                #   SVG ダイアグラム
   s02_tool_use/
   ...
   s19_mcp_plugin/
   s20_comprehensive/       # 終点セッション
-  agents/                  # 旧 12 セッションの実行可能コピー + s_full.py
+  AgentCommon/             # 共有 .NET 10 クラスライブラリ（LLM クライアント、harness、hooks、...）
+    AgentCommon.csproj
+    Config/  Llm/  Tools/  Hooks/  Permissions/  Compact/  Memory/
+    Skills/  Tasks/  Background/  Cron/  Teams/  Subagent/  Util/
+  appsettings.example.json # テンプレート、git で追跡
+  Directory.Build.props    # 共有 MSBuild 規約
+  LearnClaudeCode.slnx     # ソリューションファイル（21 プロジェクト）
+  docs/                    # 旧 12 セッション文書（web アプリが依然として読む）
   skills/                  # s07 で使用するスキルファイル
-  docs/                    # 旧 12 セッション文書、移行期間中は保持
-  web/                     # 現在は docs/ の旧版内容を生成・表示
-  tests/
+  web/                     # docs/ を描画する Next.js アプリ
 ```
 
 ## 次のステップ -- 理解から出荷へ

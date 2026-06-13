@@ -205,7 +205,7 @@ Each `create_task` writes a JSON file, each `claim_task` / `complete_task` updat
 
 ```sh
 cd learn-claude-code
-python s12_task_system/code.py
+dotnet run --project s12_task_system
 ```
 
 Try these prompts:

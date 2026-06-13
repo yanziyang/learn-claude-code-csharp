@@ -174,7 +174,7 @@ def agent_loop(messages: list, context: dict):
 
 ```sh
 cd learn-claude-code
-python s10_system_prompt/code.py
+dotnet run --project s10_system_prompt
 ```
 
 観察のポイント：
@@ -187,7 +187,7 @@ python s10_system_prompt/code.py
 
 1. `Read the file README.md`（常にロードされる 3 つのセクションを観察）
 2. `Create a file called .memory/MEMORY.md with content "- [test](test.md) — test memory"`（記憶インデックスを書き込み）
-3. `Read the file code.py`（memory セクションが表示されるか観察）
+3. `Read the file Program.cs`（memory セクションが表示されるか観察）
 
 ---
 

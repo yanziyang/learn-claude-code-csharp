@@ -136,7 +136,7 @@ for block in response.content:
 
 ```sh
 cd learn-claude-code
-python s02_tool_use/code.py
+dotnet run --project s02_tool_use
 ```
 
 试试这些 prompt：
@@ -144,7 +144,7 @@ python s02_tool_use/code.py
 1. `Read the file README.md and tell me what this project is about`
 2. `Create a file called test.py that prints "hello", then read it back`
 3. `Find all Python files in this directory`
-4. `Read both README.md and requirements.txt, then create a summary file`
+4. `Read both README.md and Program.cs, then create a summary file`
 
 观察重点：模型什么时候只调一个工具，什么时候一次调多个？多个工具调用的顺序和结果是否正确？
 

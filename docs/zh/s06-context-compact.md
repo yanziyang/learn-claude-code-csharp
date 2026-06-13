@@ -2,7 +2,7 @@
 
 `s01 > s02 > s03 > s04 > s05 > [ s06 ] | s07 > s08 > s09 > s10 > s11 > s12`
 
-> *"上下文总会满, 要有办法腾地方"* -- 三层压缩策略, 换来无限会话。
+> *"上下文总会满, 要有办法腾地方"* -- 四层压缩策略, 换来无限会话。
 >
 > **Harness 层**: 压缩 -- 干净的记忆, 无限的会话。
 
@@ -12,7 +12,7 @@
 
 ## 解决方案
 
-三层压缩, 激进程度递增:
+四层压缩, 激进程度递增 (`AgentCommon/Compact/ContextCompactor.cs`):
 
 ```
 Every turn:
@@ -21,9 +21,17 @@ Every turn:
 +------------------+
         |
         v
-[Layer 1: micro_compact]        (silent, every turn)
-  Replace tool_result > 3 turns old
-  with "[Previous: used {tool_name}]"
+[L3: ToolResultBudget]    (silent, every turn)
+  Persist large tool_results to .task_outputs/tool-results/
+  Replace in-context copy with a placeholder + file path
+        |
+        v
+[L1: SnipCompact]         (silent, every turn)
+  Drop middle messages when count > 50
+        |
+        v
+[L2: MicroCompact]        (silent, every turn)
+  Replace tool_result > 3 turns old with "[Previous: used {tool_name}]"
         |
         v
 [Check: tokens > 50000?]
@@ -31,73 +39,81 @@ Every turn:
    no              yes
    |               |
    v               v
-continue    [Layer 2: auto_compact]
-              Save transcript to .transcripts/
-              LLM summarizes conversation.
-              Replace all messages with [summary].
-                    |
-                    v
-            [Layer 3: compact tool]
-              Model calls compact explicitly.
-              Same summarization as auto_compact.
+continue    [L4: CompactHistory]
+            Save transcript to .transcripts/
+            LLM summarizes conversation.
+            Replace all messages with [summary] + tail.
 ```
 
 ## 工作原理
 
-1. **第一层 -- micro_compact**: 每次 LLM 调用前, 将旧的 tool result 替换为占位符。
+1. **L3 -- ToolResultBudget**: 将过大的 tool_result 持久化到磁盘, 上下文中的副本替换为占位符。
 
-```python
-def micro_compact(messages: list) -> list:
-    tool_results = []
-    for i, msg in enumerate(messages):
-        if msg["role"] == "user" and isinstance(msg.get("content"), list):
-            for j, part in enumerate(msg["content"]):
-                if isinstance(part, dict) and part.get("type") == "tool_result":
-                    tool_results.append((i, j, part))
-    if len(tool_results) <= KEEP_RECENT:
-        return messages
-    for _, _, part in tool_results[:-KEEP_RECENT]:
-        if len(part.get("content", "")) > 100:
-            part["content"] = f"[Previous: used {tool_name}]"
-    return messages
+```csharp
+private void ToolResultBudget(List<Message> messages)
+{
+    var last = messages[^1];
+    if (last.Role != "user") return;
+    var blocks = last.Content.OfType<ToolResultBlock>().ToList();
+    if (blocks.Count == 0) return;
+
+    long total = blocks.Sum(b => b.Content?.Length ?? 0);
+    if (total <= _toolResultBudgetBytes) return;
+
+    var ranked = blocks.OrderByDescending(b => b.Content?.Length ?? 0).ToList();
+    foreach (var block in ranked)
+    {
+        if (total <= _toolResultBudgetBytes) break;
+        var path = PersistToDisk(block.Content);   // 写入 .task_outputs/
+        block.Content = $"[See {path} for full output]";
+        total -= block.Content.Length;
+    }
+}
 ```
 
-2. **第二层 -- auto_compact**: token 超过阈值时, 保存完整对话到磁盘, 让 LLM 做摘要。
+2. **L1 + L2 -- Snip + MicroCompact**: 每次 LLM 调用前执行。
 
-```python
-def auto_compact(messages: list) -> list:
-    # Save transcript for recovery
-    transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
-    with open(transcript_path, "w") as f:
-        for msg in messages:
-            f.write(json.dumps(msg, default=str) + "\n")
-    # LLM summarizes
-    response = client.messages.create(
-        model=MODEL,
-        messages=[{"role": "user", "content":
-            "Summarize this conversation for continuity..."
-            + json.dumps(messages, default=str)[:80000]}],
-        max_tokens=2000,
-    )
-    return [
-        {"role": "user", "content": f"[Compressed]\n\n{response.content[0].text}"},
-    ]
+```csharp
+public void PrepareBeforeLlm(List<Message> messages)
+{
+    ToolResultBudget(messages);
+    SnipCompact(messages);    // count > maxMessages 时切掉中间
+    MicroCompact(messages);   // 旧 tool_result 替换为占位符
+}
 ```
 
-3. **第三层 -- manual compact**: `compact` 工具按需触发同样的摘要机制。
+3. **L4 -- CompactHistory**: 模型返回 `prompt_too_long` 时, 把完整 transcript 写入磁盘, 让 LLM 做摘要。
 
-4. 循环整合三层:
+```csharp
+public async Task<List<Message>> EmergencyAsync(List<Message> messages, CancellationToken ct = default)
+{
+    var transcriptPath = WriteTranscript(messages);
+    _onLog?.Invoke($"[transcript saved: {transcriptPath}]");
+    var summary = await SummarizeHistoryAsync(messages, ct);
 
-```python
-def agent_loop(messages: list):
-    while True:
-        micro_compact(messages)                        # Layer 1
-        if estimate_tokens(messages) > THRESHOLD:
-            messages[:] = auto_compact(messages)       # Layer 2
-        response = client.messages.create(...)
-        # ... tool execution ...
-        if manual_compact:
-            messages[:] = auto_compact(messages)       # Layer 3
+    var tailStart = Math.Max(0, messages.Count - 5);
+    return new List<Message> { Message.UserText($"[Reactive compact]\n\n{summary}") }
+        .Concat(messages.Skip(tailStart))
+        .ToList();
+}
+```
+
+4. 循环通过 `AgentHarness.RunAsync` 自动整合全部四层。
+
+```csharp
+// AgentHarness.RunAsync 内 -- 每次迭代调用:
+Compactor.PrepareBeforeLlm(messages);
+
+try
+{
+    response = await Client.CreateMessageAsync(systemPrompt, messages, ...);
+}
+catch (InvalidOperationException ex) when (IsPromptTooLong(ex))
+{
+    messages.Clear();
+    messages.AddRange(await Compactor.EmergencyAsync(messages, ct));
+    response = await Client.CreateMessageAsync(systemPrompt, messages, ...);
+}
 ```
 
 完整历史通过 transcript 保存在磁盘上。信息没有真正丢失, 只是移出了活跃上下文。
@@ -106,21 +122,21 @@ def agent_loop(messages: list):
 
 | 组件           | 之前 (s05)       | 之后 (s06)                     |
 |----------------|------------------|--------------------------------|
-| Tools          | 5                | 5 (基础 + compact)             |
-| 上下文管理     | 无               | 三层压缩                       |
-| Micro-compact  | 无               | 旧结果 -> 占位符               |
-| Auto-compact   | 无               | token 阈值触发                 |
-| Transcripts    | 无               | 保存到 .transcripts/           |
+| Tools          | 5                | 5 (unchanged)                  |
+| 上下文管理     | 无               | Four-layer compression         |
+| Micro-compact  | 无               | Old results -> placeholders    |
+| Auto-compact   | 无               | Reactive path on overflow      |
+| Transcripts    | 无               | Saved to .transcripts/         |
 
 ## 试一试
 
 ```sh
-cd learn-claude-code
-python agents/s06_context_compact.py
+cd learn-claude-code-csharp
+dotnet run --project s08_context_compact
 ```
 
 试试这些 prompt (英文 prompt 对 LLM 效果更好, 也可以用中文):
 
-1. `Read every Python file in the agents/ directory one by one` (观察 micro-compact 替换旧结果)
+1. `Read every C# file in the AgentCommon/ directory one by one` (观察 L2 micro-compact 替换旧结果)
 2. `Keep reading files until compression triggers automatically`
-3. `Use the compact tool to manually compress the conversation`
+3. `Force a long context to overflow and observe the L4 reactive compact`

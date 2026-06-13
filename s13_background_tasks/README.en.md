@@ -14,7 +14,7 @@ s01 → ... → s11 → s12 → `s13` → [s14](../s14_cron_scheduler/) → s15 
 
 Ever used a washing machine? Throw clothes in, press start, then go do other things — cook, reply to messages, read papers. 30 minutes later the machine beeps: done. You don't stand there waiting for 30 minutes.
 
-The agent's bash tool is the same. `pip install torch` takes 10 minutes, `npm run build` takes 3 minutes. While these commands run, the agent waits for bash to return, unable to use that time to process other tasks.
+The agent's bash tool is the same. `dotnet build` on a large solution takes minutes, `npm run build` takes minutes. While these commands run, the agent waits for bash to return, unable to use that time to process other tasks.
 
 Reading files is milliseconds, no wait. `git status` returns in under a second, no wait. But `npm install`? Minutes. The agent waits 10 minutes doing nothing, and LLM calls are billed by token — idle time is waste.
 
@@ -50,7 +50,8 @@ def is_slow_operation(tool_name: str, tool_input: dict) -> bool:
         return False
     cmd = tool_input.get("command", "").lower()
     slow_keywords = ["install", "build", "test", "deploy", "compile",
-                     "docker build", "pip install", "npm install",
+                     "docker build", "dotnet build", "dotnet test",
+                     "dotnet restore", "npm install",
                      "cargo build", "pytest", "make"]
     return any(kw in cmd for kw in slow_keywords)
 
@@ -197,7 +198,7 @@ The agent didn't wait — while npm install ran in the background, it read the c
 
 ```sh
 cd learn-claude-code
-python s13_background_tasks/code.py
+dotnet run --project s13_background_tasks
 ```
 
 Try these prompts:

@@ -201,7 +201,7 @@ for block in response.content:
 
 ```sh
 cd learn-claude-code
-python s04_hooks/code.py
+dotnet run --project s04_hooks
 ```
 
 以下のプロンプトを試してみよう：

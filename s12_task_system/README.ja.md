@@ -205,7 +205,7 @@ complete_task(tests.id)     # ✓ Completed
 
 ```sh
 cd learn-claude-code
-python s12_task_system/code.py
+dotnet run --project s12_task_system
 ```
 
 以下のプロンプトを試してください：

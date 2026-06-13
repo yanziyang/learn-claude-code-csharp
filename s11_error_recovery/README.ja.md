@@ -177,7 +177,7 @@ def agent_loop(messages, context):
 
 ```sh
 cd learn-claude-code
-python s11_error_recovery/code.py
+dotnet run --project s11_error_recovery
 ```
 
 以下の prompt を試してみよう：

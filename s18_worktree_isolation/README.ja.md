@@ -151,7 +151,7 @@ def run_git(args: list[str]) -> tuple[bool, str]:
 
 ```sh
 cd learn-claude-code
-python s18_worktree_isolation/code.py
+dotnet run --project s18_worktree_isolation
 ```
 
 以下のプロンプトを試してください：

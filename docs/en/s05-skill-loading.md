@@ -40,48 +40,48 @@ Layer 1: skill *names* in system prompt (cheap). Layer 2: full *body* via tool_r
 ```
 skills/
   pdf/
-    SKILL.md       # ---\n name: pdf\n description: Process PDF files\n ---\n ...
+    SKILL.md       # ---\nname: pdf\ndescription: Process PDF files\n---\n...
   code-review/
-    SKILL.md       # ---\n name: code-review\n description: Review code\n ---\n ...
+    SKILL.md       # ---\nname: code-review\ndescription: Review code\n---\n...
 ```
 
-2. SkillLoader scans for `SKILL.md` files, uses the directory name as the skill identifier.
+2. `SkillRegistry` scans for `SKILL.md` files, parses the frontmatter, and uses the directory name as the skill identifier (`AgentCommon/Skills/SkillRegistry.cs`).
 
-```python
-class SkillLoader:
-    def __init__(self, skills_dir: Path):
-        self.skills = {}
-        for f in sorted(skills_dir.rglob("SKILL.md")):
-            text = f.read_text()
-            meta, body = self._parse_frontmatter(text)
-            name = meta.get("name", f.parent.name)
-            self.skills[name] = {"meta": meta, "body": body}
+```csharp
+public static SkillRegistry LoadFromDir(string skillsDir)
+{
+    var reg = new SkillRegistry();
+    if (!Directory.Exists(skillsDir)) return reg;
 
-    def get_descriptions(self) -> str:
-        lines = []
-        for name, skill in self.skills.items():
-            desc = skill["meta"].get("description", "")
-            lines.append(f"  - {name}: {desc}")
-        return "\n".join(lines)
+    foreach (var dir in Directory.EnumerateDirectories(skillsDir))
+    {
+        var manifest = Path.Combine(dir, "SKILL.md");
+        if (!File.Exists(manifest)) continue;
 
-    def get_content(self, name: str) -> str:
-        skill = self.skills.get(name)
-        if not skill:
-            return f"Error: Unknown skill '{name}'."
-        return f"<skill name=\"{name}\">\n{skill['body']}\n</skill>"
+        var raw = File.ReadAllText(manifest);
+        var (name, desc) = ParseFrontmatter(raw);
+        if (string.IsNullOrEmpty(name)) name = Path.GetFileName(dir);
+        reg._byName[name] = new SkillManifest
+        {
+            Name = name,
+            Description = desc,
+            FullContent = raw,
+        };
+    }
+    return reg;
+}
 ```
 
 3. Layer 1 goes into the system prompt. Layer 2 is just another tool handler.
 
-```python
-SYSTEM = f"""You are a coding agent at {WORKDIR}.
-Skills available:
-{SKILL_LOADER.get_descriptions()}"""
+```csharp
+var skills = SkillRegistry.LoadFromDir(skillsDir);
 
-TOOL_HANDLERS = {
-    # ...base tools...
-    "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
-}
+var system = $"You are a coding agent at {workDir}.\n" +
+             $"Skills available:\n{skills.Catalog()}";
+
+SkillTools.Register(tools, skills);
+// → registers a "load_skill" tool that returns SkillManifest.FullContent
 ```
 
 The model learns what skills exist (cheap) and loads them when relevant (expensive).
@@ -92,14 +92,14 @@ The model learns what skills exist (cheap) and loads them when relevant (expensi
 |----------------|------------------|----------------------------|
 | Tools          | 5 (base + task)  | 5 (base + load_skill)      |
 | System prompt  | Static string    | + skill descriptions       |
-| Knowledge      | None             | skills/\*/SKILL.md files   |
+| Knowledge      | None             | skills/*/SKILL.md files    |
 | Injection      | None             | Two-layer (system + result)|
 
 ## Try It
 
 ```sh
-cd learn-claude-code
-python agents/s05_skill_loading.py
+cd learn-claude-code-csharp
+dotnet run --project s07_skill_loading
 ```
 
 1. `What skills are available?`

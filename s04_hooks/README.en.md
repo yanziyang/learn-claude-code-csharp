@@ -201,7 +201,7 @@ Four hooks cover the critical nodes of the agent cycle: input → before executi
 
 ```sh
 cd learn-claude-code
-python s04_hooks/code.py
+dotnet run --project s04_hooks
 ```
 
 Try these prompts:

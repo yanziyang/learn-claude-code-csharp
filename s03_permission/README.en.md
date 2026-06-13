@@ -133,7 +133,7 @@ for block in response.content:
 
 ```sh
 cd learn-claude-code
-python s03_permission/code.py
+dotnet run --project s03_permission
 ```
 
 Try these prompts:

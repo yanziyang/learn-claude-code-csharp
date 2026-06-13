@@ -170,7 +170,7 @@ Session memory focuses on continuity inside one session: what context should sur
 
 ```sh
 cd learn-claude-code
-python s09_memory/code.py
+dotnet run --project s09_memory
 ```
 
 Try these prompts (enter across multiple turns, observe memory accumulation and loading):

@@ -112,7 +112,7 @@ The dispatch mechanism is unchanged; the task tool is routed through `TOOL_HANDL
 
 ```sh
 cd learn-claude-code
-python s06_subagent/code.py
+dotnet run --project s06_subagent
 ```
 
 Try these prompts:

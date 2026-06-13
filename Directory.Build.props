@@ -1,0 +1,22 @@
+<Project>
+
+  <!--
+    Repo-wide build conventions applied to every .NET project under this root.
+    Chapter projects also copy their appsettings.json next to the .exe so
+    AgentConfigLoader.Load() can find it at runtime.
+  -->
+
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup Condition="Exists('$(MSBuildProjectDirectory)\appsettings.json')">
+    <Content Include="$(MSBuildProjectDirectory)\appsettings.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+</Project>

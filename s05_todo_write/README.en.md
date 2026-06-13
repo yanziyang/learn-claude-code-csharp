@@ -113,7 +113,7 @@ Typical flow when the Agent receives a task: first call `todo_write` to list all
 
 ```sh
 cd learn-claude-code
-python s05_todo_write/code.py
+dotnet run --project s05_todo_write
 ```
 
 Try these prompts:

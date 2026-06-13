@@ -10,7 +10,7 @@
 
 s09 中队友能干活能通信, 但缺少结构化协调:
 
-**关机**: 直接杀线程会留下写了一半的文件和过期的 config.json。需要握手 -- 领导请求, 队友批准 (收尾退出) 或拒绝 (继续干)。
+**关机**: 直接杀线程会留下写了一半的文件和过期的 bus 状态。需要握手 -- 领导请求, 队友批准 (收尾退出) 或拒绝 (继续干)。
 
 **计划审批**: 领导说 "重构认证模块", 队友立刻开干。高风险变更应该先过审。
 
@@ -42,42 +42,55 @@ Trackers:
 
 ## 工作原理
 
-1. 领导生成 request_id, 通过收件箱发起关机请求。
+1. 领导生成 `request_id`, 通过收件箱发起关机请求。
 
-```python
-shutdown_requests = {}
+```csharp
+var shutdownRequests = new ConcurrentDictionary<string, ShutdownRequest>();
 
-def handle_shutdown_request(teammate: str) -> str:
-    req_id = str(uuid.uuid4())[:8]
-    shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
-    BUS.send("lead", teammate, "Please shut down gracefully.",
-             "shutdown_request", {"request_id": req_id})
-    return f"Shutdown request {req_id} sent (status: pending)"
+void HandleShutdownRequest(string teammate)
+{
+    var reqId = $"shr_{Guid.NewGuid():N}"[..11];
+    shutdownRequests[reqId] = new ShutdownRequest(teammate, "pending");
+    bus.Send("lead", teammate, "Please shut down gracefully.",
+             "shutdown_request", new Dictionary<string, object>
+             {
+                 ["request_id"] = reqId,
+             });
+}
 ```
 
 2. 队友收到请求后, 用 approve/reject 响应。
 
-```python
-if tool_name == "shutdown_response":
-    req_id = args["request_id"]
-    approve = args["approve"]
-    shutdown_requests[req_id]["status"] = "approved" if approve else "rejected"
-    BUS.send(sender, "lead", args.get("reason", ""),
-             "shutdown_response",
-             {"request_id": req_id, "approve": approve})
+```csharp
+// 队友的工具处理器内:
+if (toolName == "shutdown_response")
+{
+    var reqId = args["request_id"];
+    var approve = (bool)args["approve"];
+    shutdownRequests[reqId].Status = approve ? "approved" : "rejected";
+    bus.Send(teammateName, "lead", args.GetValueOrDefault("reason", ""),
+             "shutdown_response", new Dictionary<string, object>
+             {
+                 ["request_id"] = reqId,
+                 ["approve"] = approve,
+             });
+}
 ```
 
-3. 计划审批遵循完全相同的模式。队友提交计划 (生成 request_id), 领导审查 (引用同一个 request_id)。
+3. 计划审批遵循完全相同的模式。队友提交计划(生成 `request_id`), 领导审查(引用同一个 `request_id`)。
 
-```python
-plan_requests = {}
-
-def handle_plan_review(request_id, approve, feedback=""):
-    req = plan_requests[request_id]
-    req["status"] = "approved" if approve else "rejected"
-    BUS.send("lead", req["from"], feedback,
-             "plan_approval_response",
-             {"request_id": request_id, "approve": approve})
+```csharp
+void HandlePlanReview(string requestId, bool approve, string feedback = "")
+{
+    var req = planRequests[requestId];
+    req.Status = approve ? "approved" : "rejected";
+    bus.Send("lead", req.From, feedback,
+             "plan_approval_response", new Dictionary<string, object>
+             {
+                 ["request_id"] = requestId,
+                 ["approve"] = approve,
+             });
+}
 ```
 
 一个 FSM, 两种用途。同样的 `pending -> approved | rejected` 状态机可以套用到任何请求-响应协议上。
@@ -95,8 +108,8 @@ def handle_plan_review(request_id, approve, feedback=""):
 ## 试一试
 
 ```sh
-cd learn-claude-code
-python agents/s10_team_protocols.py
+cd learn-claude-code-csharp
+dotnet run --project s16_team_protocols
 ```
 
 试试这些 prompt (英文 prompt 对 LLM 效果更好, 也可以用中文):

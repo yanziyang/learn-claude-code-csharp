@@ -211,7 +211,7 @@ if len(messages) <= 3:
 
 ```sh
 cd learn-claude-code
-python s17_autonomous_agents/code.py
+dotnet run --project s17_autonomous_agents
 ```
 
 试试这个 prompt：

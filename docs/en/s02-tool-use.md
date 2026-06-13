@@ -31,69 +31,78 @@ One lookup replaces any if/elif chain.
 
 ## How It Works
 
-1. Each tool gets a handler function. Path sandboxing prevents workspace escape.
+1. Each tool gets a handler function. Path sandboxing prevents workspace escape (`AgentCommon/Util/PathGuard.cs`).
 
-```python
-def safe_path(p: str) -> Path:
-    path = (WORKDIR / p).resolve()
-    if not path.is_relative_to(WORKDIR):
-        raise ValueError(f"Path escapes workspace: {p}")
-    return path
+```csharp
+public static string SafePath(string workDir, string p)
+{
+    var root = Path.GetFullPath(workDir);
+    var candidate = Path.IsPathRooted(p) ? p : Path.Combine(root, p);
+    var resolved = Path.GetFullPath(candidate);
 
-def run_read(path: str, limit: int = None) -> str:
-    text = safe_path(path).read_text()
-    lines = text.splitlines()
-    if limit and limit < len(lines):
-        lines = lines[:limit]
-    return "\n".join(lines)[:50000]
+    var rootWithSep = root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+                   + Path.DirectorySeparatorChar;
+    if (!resolved.StartsWith(rootWithSep, StringComparison.OrdinalIgnoreCase)
+        && !string.Equals(resolved, root, StringComparison.OrdinalIgnoreCase))
+    {
+        throw new InvalidOperationException($"Path escapes workspace: {p}");
+    }
+    return resolved;
+}
 ```
 
-2. The dispatch map links tool names to handlers.
+2. Each tool registers a name, JSON schema, and handler against the central `ToolRegistry`.
 
-```python
-TOOL_HANDLERS = {
-    "bash":       lambda **kw: run_bash(kw["command"]),
-    "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
-    "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
-    "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"],
-                                        kw["new_text"]),
-}
+```csharp
+var tools = new ToolRegistry();
+BashTool.Register(tools, workDir);
+
+tools.Register("read_file", "Read file contents.",
+    SchemaBuilder.Object("Read file contents.",
+        new Dictionary<string, (string, string, bool)>
+        {
+            ["path"]  = ("string",  "Path to the file (relative to workspace)", true),
+            ["limit"] = ("integer", "Optional maximum number of lines to read", false),
+        }),
+    input =>
+    {
+        var pathStr = input.GetProperty("path").GetString() ?? "";
+        var resolved = PathGuard.SafePath(workDir, pathStr);
+        var lines = File.ReadAllText(resolved).Split('\n');
+        return string.Join("\n", lines);
+    });
 ```
 
 3. In the loop, look up the handler by name. The loop body itself is unchanged from s01.
 
-```python
-for block in response.content:
-    if block.type == "tool_use":
-        handler = TOOL_HANDLERS.get(block.name)
-        output = handler(**block.input) if handler \
-            else f"Unknown tool: {block.name}"
-        results.append({
-            "type": "tool_result",
-            "tool_use_id": block.id,
-            "content": output,
-        })
+```csharp
+foreach (var block in response.Content.OfType<ToolUseBlock>())
+{
+    // Hooks first; permission gate second; dispatch last.
+    var output = tools.Invoke(block.Name, block.Input);
+    results.Add(new ToolResultBlock(block.Id, output));
+}
 ```
 
-Add a tool = add a handler + add a schema entry. The loop never changes.
+Add a tool = add a `tools.Register(...)` call. The loop never changes.
 
 ## What Changed From s01
 
 | Component      | Before (s01)       | After (s02)                |
 |----------------|--------------------|----------------------------|
 | Tools          | 1 (bash only)      | 4 (bash, read, write, edit)|
-| Dispatch       | Hardcoded bash call | `TOOL_HANDLERS` dict       |
-| Path safety    | None               | `safe_path()` sandbox      |
+| Dispatch       | Hardcoded bash call | `ToolRegistry.Invoke`    |
+| Path safety    | None               | `PathGuard.SafePath()`     |
 | Agent loop     | Unchanged          | Unchanged                  |
 
 ## Try It
 
 ```sh
-cd learn-claude-code
-python agents/s02_tool_use.py
+cd learn-claude-code-csharp
+dotnet run --project s02_tool_use
 ```
 
-1. `Read the file requirements.txt`
-2. `Create a file called greet.py with a greet(name) function`
-3. `Edit greet.py to add a docstring to the function`
-4. `Read greet.py to verify the edit worked`
+1. `Read the file README.md`
+2. `Create a file called greet.cs with a Greet(string name) method`
+3. `Edit greet.cs to add an XML doc comment to the method`
+4. `Read greet.cs to verify the edit worked`

@@ -19,94 +19,98 @@ Teammate lifecycle:
   spawn -> WORKING -> IDLE -> WORKING -> ... -> SHUTDOWN
 
 Communication:
-  .team/
-    config.json           <- team roster + statuses
-    inbox/
-      alice.jsonl         <- append-only, drain-on-read
-      bob.jsonl
-      lead.jsonl
+  .mailboxes/
+    lead.jsonl            <- append-only, drain-on-read
+    alice.jsonl
+    bob.jsonl
 
-              +--------+    send("alice","bob","...")    +--------+
+              +--------+    bus.Send("alice","bob","...")   +--------+
               | alice  | -----------------------------> |  bob   |
               | loop   |    bob.jsonl << {json_line}    |  loop  |
               +--------+                                +--------+
                    ^                                         |
-                   |        BUS.read_inbox("alice")          |
+                   |        bus.ReadInbox("alice")          |
                    +---- alice.jsonl -> read + drain ---------+
 ```
 
 ## How It Works
 
-1. TeammateManager maintains config.json with the team roster.
+1. The `MessageBus` writes one JSONL file per agent under `.mailboxes/` (`AgentCommon/Teams/MessageBus.cs`).
 
-```python
-class TeammateManager:
-    def __init__(self, team_dir: Path):
-        self.dir = team_dir
-        self.dir.mkdir(exist_ok=True)
-        self.config_path = self.dir / "config.json"
-        self.config = self._load_config()
-        self.threads = {}
+```csharp
+public sealed class MessageBus
+{
+    private readonly string _mailboxDir;
+
+    public MessageBus(string workDir, Action<string>? onLog = null)
+    {
+        _mailboxDir = Path.Combine(workDir, ".mailboxes");
+        Directory.CreateDirectory(_mailboxDir);
+    }
+
+    public void Send(string from, string to, string content, string msgType = "message")
+    {
+        var msg = new MailboxMessage
+        {
+            From = from, To = to, Content = content, Type = msgType,
+            Ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0,
+        };
+        var inbox = Path.Combine(_mailboxDir, $"{to}.jsonl");
+        lock (_lock)
+        {
+            File.AppendAllText(inbox, JsonSerializer.Serialize(msg) + "\n");
+        }
+    }
+}
 ```
 
-2. `spawn()` creates a teammate and starts its agent loop in a thread.
+2. `ReadInbox` consumes the whole inbox in one call: read all lines, delete the file.
 
-```python
-def spawn(self, name: str, role: str, prompt: str) -> str:
-    member = {"name": name, "role": role, "status": "working"}
-    self.config["members"].append(member)
-    self._save_config()
-    thread = threading.Thread(
-        target=self._teammate_loop,
-        args=(name, role, prompt), daemon=True)
-    thread.start()
-    return f"Spawned teammate '{name}' (role: {role})"
+```csharp
+public List<MailboxMessage> ReadInbox(string agent)
+{
+    var inbox = Path.Combine(_mailboxDir, $"{agent}.jsonl");
+    if (!File.Exists(inbox)) return new List<MailboxMessage>();
+
+    List<MailboxMessage> msgs;
+    lock (_lock)
+    {
+        var lines = File.ReadAllText(inbox).Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        msgs = lines.Select(l => JsonSerializer.Deserialize<MailboxMessage>(l)!).ToList();
+        File.Delete(inbox);   // consume: read + delete
+    }
+    return msgs;
+}
 ```
 
-3. MessageBus: append-only JSONL inboxes. `send()` appends a JSON line; `read_inbox()` reads all and drains.
+3. `TeamTools` registers three tools on the lead: `spawn_teammate`, `send_message`, `check_inbox`.
 
-```python
-class MessageBus:
-    def send(self, sender, to, content, msg_type="message", extra=None):
-        msg = {"type": msg_type, "from": sender,
-               "content": content, "timestamp": time.time()}
-        if extra:
-            msg.update(extra)
-        with open(self.dir / f"{to}.jsonl", "a") as f:
-            f.write(json.dumps(msg) + "\n")
-
-    def read_inbox(self, name):
-        path = self.dir / f"{name}.jsonl"
-        if not path.exists(): return "[]"
-        msgs = [json.loads(l) for l in path.read_text().strip().splitlines() if l]
-        path.write_text("")  # drain
-        return json.dumps(msgs, indent=2)
+```csharp
+var bus = new MessageBus(workDir);
+TeamTools.Register(tools, bus, client, config, workDir);
+// → spawn_teammate: starts a TeammateRunner on a background thread
+// → send_message:  bus.Send("lead", to, content)
+// → check_inbox:   bus.ReadInbox("lead") (drained)
 ```
 
-4. Each teammate checks its inbox before every LLM call, injecting received messages into context.
+4. Each `TeammateRunner` checks its own inbox before every LLM call, injecting received messages into context.
 
-```python
-def _teammate_loop(self, name, role, prompt):
-    messages = [{"role": "user", "content": prompt}]
-    for _ in range(50):
-        inbox = BUS.read_inbox(name)
-        if inbox != "[]":
-            messages.append({"role": "user",
-                "content": f"<inbox>{inbox}</inbox>"})
-        response = client.messages.create(...)
-        if response.stop_reason != "tool_use":
-            break
-        # execute tools, append results...
-    self._find_member(name)["status"] = "idle"
+```csharp
+// In a TeammateRunner hook (paraphrased):
+var msgs = bus.ReadInbox(name);
+if (msgs.Count > 0)
+    messages.Add(Message.UserText(
+        "<inbox>\n" + JsonSerializer.Serialize(msgs, new JsonSerializerOptions { WriteIndented = true })
+        + "\n</inbox>"));
 ```
 
 ## What Changed From s08
 
 | Component      | Before (s08)     | After (s09)                |
 |----------------|------------------|----------------------------|
-| Tools          | 6                | 9 (+spawn/send/read_inbox) |
+| Tools          | 6                | 9 (+spawn/send/check_inbox)|
 | Agents         | Single           | Lead + N teammates         |
-| Persistence    | None             | config.json + JSONL inboxes|
+| Persistence    | None             | JSONL inboxes under .mailboxes/ |
 | Threads        | Background cmds  | Full agent loops per thread|
 | Lifecycle      | Fire-and-forget  | idle -> working -> idle    |
 | Communication  | None             | message + broadcast        |
@@ -114,8 +118,8 @@ def _teammate_loop(self, name, role, prompt):
 ## Try It
 
 ```sh
-cd learn-claude-code
-python agents/s09_agent_teams.py
+cd learn-claude-code-csharp
+dotnet run --project s15_agent_teams
 ```
 
 1. `Spawn alice (coder) and bob (tester). Have alice send bob a message.`

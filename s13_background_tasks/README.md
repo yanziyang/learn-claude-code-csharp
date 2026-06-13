@@ -14,7 +14,7 @@ s01 → ... → s11 → s12 → `s13` → [s14](../s14_cron_scheduler/) → s15 
 
 你用过洗衣机吗？把衣服扔进去，按下启动，然后去干别的——做饭、回消息、看论文。30 分钟后洗衣机"滴滴滴"提醒你：好了。你不会站在洗衣机前面干等 30 分钟。
 
-Agent 的 bash 工具也一样。`pip install torch` 要 10 分钟，`npm run build` 要 3 分钟。这些命令一跑，Agent 就在等 bash 工具返回，没法利用这段时间处理别的任务。
+Agent 的 bash 工具也一样。在大型 solution 上跑 `dotnet build` 要好几分钟，`npm run build` 也要几分钟。这些命令一跑，Agent 就在等 bash 工具返回，没法利用这段时间处理别的任务。
 
 读文件是毫秒级，不等。`git status` 一秒内返回，不等。但 `npm install`？分钟级。Agent 等 10 分钟什么都不做，而 LLM 按 token 计费，空转就是浪费。
 
@@ -50,7 +50,8 @@ def is_slow_operation(tool_name: str, tool_input: dict) -> bool:
         return False
     cmd = tool_input.get("command", "").lower()
     slow_keywords = ["install", "build", "test", "deploy", "compile",
-                     "docker build", "pip install", "npm install",
+                     "docker build", "dotnet build", "dotnet test",
+                     "dotnet restore", "npm install",
                      "cargo build", "pytest", "make"]
     return any(kw in cmd for kw in slow_keywords)
 
@@ -197,7 +198,7 @@ Agent 没干等，npm install 跑后台的时候，它去读了配置文件。
 
 ```sh
 cd learn-claude-code
-python s13_background_tasks/code.py
+dotnet run --project s13_background_tasks
 ```
 
 试试这些 prompt：

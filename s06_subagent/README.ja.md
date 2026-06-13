@@ -112,7 +112,7 @@ TOOL_HANDLERS["task"] = spawn_subagent
 
 ```sh
 cd learn-claude-code
-python s06_subagent/code.py
+dotnet run --project s06_subagent
 ```
 
 以下のプロンプトを試してみよう：

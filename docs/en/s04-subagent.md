@@ -8,7 +8,7 @@
 
 ## Problem
 
-As the agent works, its messages array grows. Every file read, every bash output stays in context permanently. "What testing framework does this project use?" might require reading 5 files, but the parent only needs the answer: "pytest."
+As the agent works, its messages array grows. Every file read, every bash output stays in context permanently. "What testing framework does this project use?" might require reading 5 files, but the parent only needs the answer: "xUnit."
 
 ## Solution
 
@@ -30,45 +30,50 @@ Parent context stays clean. Subagent context is discarded.
 
 1. The parent gets a `task` tool. The child gets all base tools except `task` (no recursive spawning).
 
-```python
-PARENT_TOOLS = CHILD_TOOLS + [
-    {"name": "task",
-     "description": "Spawn a subagent with fresh context.",
-     "input_schema": {
-         "type": "object",
-         "properties": {"prompt": {"type": "string"}},
-         "required": ["prompt"],
-     }},
-]
+```csharp
+// Parent toolset = base + task
+var parentTools = new ToolRegistry();
+BashTool.Register(parentTools, workDir);
+FileTools.Register(parentTools, workDir);
+
+// Child toolset = base only
+var childTools = new ToolRegistry();
+BashTool.Register(childTools, workDir);
+FileTools.Register(childTools, workDir);
+
+TaskTool.Register(parentTools, () =>
+    new SubagentRunner(client, config, childTools,
+        systemPrompt: "You are a focused sub-agent. Return a concise summary."));
 ```
 
-2. The subagent starts with `messages=[]` and runs its own loop. Only the final text returns to the parent.
+2. The subagent starts with `messages = []` and runs its own loop. Only the final text returns to the parent (`AgentCommon/Subagent/SubagentRunner.cs`).
 
-```python
-def run_subagent(prompt: str) -> str:
-    sub_messages = [{"role": "user", "content": prompt}]
-    for _ in range(30):  # safety limit
-        response = client.messages.create(
-            model=MODEL, system=SUBAGENT_SYSTEM,
-            messages=sub_messages,
-            tools=CHILD_TOOLS, max_tokens=8000,
-        )
-        sub_messages.append({"role": "assistant",
-                             "content": response.content})
-        if response.stop_reason != "tool_use":
-            break
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                output = handler(**block.input)
-                results.append({"type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": str(output)[:50000]})
-        sub_messages.append({"role": "user", "content": results})
-    return "".join(
-        b.text for b in response.content if hasattr(b, "text")
-    ) or "(no summary)"
+```csharp
+public async Task<string> RunAsync(string description, CancellationToken ct = default)
+{
+    var messages = new List<Message> { Message.UserText(description) };
+
+    LlmResponse? last = null;
+    for (var i = 0; i < _maxIterations; i++)
+    {
+        last = await _client.CreateMessageAsync(
+            _systemPrompt, messages, _tools.AllSpecs().ToList(), ct: ct);
+        messages.Add(Message.Assistant(last.Content));
+
+        if (last.StopReason != "tool_use")
+            break;
+
+        var results = new List<ToolResultBlock>();
+        foreach (var block in last.Content.OfType<ToolUseBlock>())
+        {
+            var output = _tools.Invoke(block.Name, block.Input);
+            results.Add(new ToolResultBlock(block.Id, output));
+        }
+        messages.Add(Message.UserToolResults(results));
+    }
+
+    return ExtractFinalText(last, messages);
+}
 ```
 
 The child's entire message history (possibly 30+ tool calls) is discarded. The parent receives a one-paragraph summary as a normal `tool_result`.
@@ -79,16 +84,16 @@ The child's entire message history (possibly 30+ tool calls) is discarded. The p
 |----------------|------------------|---------------------------|
 | Tools          | 5                | 5 (base) + task (parent)  |
 | Context        | Single shared    | Parent + child isolation  |
-| Subagent       | None             | `run_subagent()` function |
+| Subagent       | None             | `SubagentRunner` class    |
 | Return value   | N/A              | Summary text only         |
 
 ## Try It
 
 ```sh
-cd learn-claude-code
-python agents/s04_subagent.py
+cd learn-claude-code-csharp
+dotnet run --project s06_subagent
 ```
 
 1. `Use a subtask to find what testing framework this project uses`
-2. `Delegate: read all .py files and summarize what each one does`
+2. `Delegate: read all .cs files and summarize what each one does`
 3. `Use a task to create a new module, then verify it from here`

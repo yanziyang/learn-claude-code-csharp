@@ -10,7 +10,7 @@
 
 s09ではチームメイトが作業し通信するが、構造化された協調がない:
 
-**シャットダウン**: スレッドを強制終了するとファイルが中途半端に書かれ、config.jsonが不正な状態になる。ハンドシェイクが必要 -- リーダーが要求し、チームメイトが承認(完了して退出)か拒否(作業継続)する。
+**シャットダウン**: スレッドを強制終了するとファイルが中途半端に書かれ、busの状態が不正になる。ハンドシェイクが必要 -- リーダーが要求し、チームメイトが承認(完了して退出)か拒否(作業継続)する。
 
 **プラン承認**: リーダーが「認証モジュールをリファクタリングして」と言うと、チームメイトは即座に開始する。リスクの高い変更では、実行前にリーダーが計画をレビューすべきだ。
 
@@ -42,45 +42,58 @@ Trackers:
 
 ## 仕組み
 
-1. リーダーがrequest_idを生成し、インボックス経由でシャットダウンを開始する。
+1. リーダーが `request_id` を生成し、インボックス経由でシャットダウンを開始する。
 
-```python
-shutdown_requests = {}
+```csharp
+var shutdownRequests = new ConcurrentDictionary<string, ShutdownRequest>();
 
-def handle_shutdown_request(teammate: str) -> str:
-    req_id = str(uuid.uuid4())[:8]
-    shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
-    BUS.send("lead", teammate, "Please shut down gracefully.",
-             "shutdown_request", {"request_id": req_id})
-    return f"Shutdown request {req_id} sent (status: pending)"
+void HandleShutdownRequest(string teammate)
+{
+    var reqId = $"shr_{Guid.NewGuid():N}"[..11];
+    shutdownRequests[reqId] = new ShutdownRequest(teammate, "pending");
+    bus.Send("lead", teammate, "Please shut down gracefully.",
+             "shutdown_request", new Dictionary<string, object>
+             {
+                 ["request_id"] = reqId,
+             });
+}
 ```
 
 2. チームメイトがリクエストを受信し、承認または拒否で応答する。
 
-```python
-if tool_name == "shutdown_response":
-    req_id = args["request_id"]
-    approve = args["approve"]
-    shutdown_requests[req_id]["status"] = "approved" if approve else "rejected"
-    BUS.send(sender, "lead", args.get("reason", ""),
-             "shutdown_response",
-             {"request_id": req_id, "approve": approve})
+```csharp
+// チームメイトのツールハンドラ内:
+if (toolName == "shutdown_response")
+{
+    var reqId = args["request_id"];
+    var approve = (bool)args["approve"];
+    shutdownRequests[reqId].Status = approve ? "approved" : "rejected";
+    bus.Send(teammateName, "lead", args.GetValueOrDefault("reason", ""),
+             "shutdown_response", new Dictionary<string, object>
+             {
+                 ["request_id"] = reqId,
+                 ["approve"] = approve,
+             });
+}
 ```
 
-3. プラン承認も同一パターン。チームメイトがプランを提出(request_idを生成)、リーダーがレビュー(同じrequest_idを参照)。
+3. プラン承認も同一パターン。チームメイトがプランを提出(`request_id` を生成)、リーダーがレビュー(同じ `request_id` を参照)。
 
-```python
-plan_requests = {}
-
-def handle_plan_review(request_id, approve, feedback=""):
-    req = plan_requests[request_id]
-    req["status"] = "approved" if approve else "rejected"
-    BUS.send("lead", req["from"], feedback,
-             "plan_approval_response",
-             {"request_id": request_id, "approve": approve})
+```csharp
+void HandlePlanReview(string requestId, bool approve, string feedback = "")
+{
+    var req = planRequests[requestId];
+    req.Status = approve ? "approved" : "rejected";
+    bus.Send("lead", req.From, feedback,
+             "plan_approval_response", new Dictionary<string, object>
+             {
+                 ["request_id"] = requestId,
+                 ["approve"] = approve,
+             });
+}
 ```
 
-1つのFSM、2つの応用。同じ`pending -> approved | rejected`状態機械が、あらゆるリクエスト-レスポンスプロトコルに適用できる。
+1つのFSM、2つの応用。同じ `pending -> approved | rejected` 状態機械が、あらゆるリクエスト-レスポンスプロトコルに適用できる。
 
 ## s09からの変更点
 
@@ -95,8 +108,8 @@ def handle_plan_review(request_id, approve, feedback=""):
 ## 試してみる
 
 ```sh
-cd learn-claude-code
-python agents/s10_team_protocols.py
+cd learn-claude-code-csharp
+dotnet run --project s16_team_protocols
 ```
 
 1. `Spawn alice as a coder. Then request her shutdown.`

@@ -171,7 +171,7 @@ session memory 关注同一会话内的连续性：compact 之后，当前会话
 
 ```sh
 cd learn-claude-code
-python s09_memory/code.py
+dotnet run --project s09_memory
 ```
 
 试试这些 prompt（分多轮输入，观察记忆的累积和加载）：

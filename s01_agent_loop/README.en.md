@@ -118,15 +118,16 @@ Under 30 lines — that's the minimal runnable agent harness kernel. It's not in
 **Setup** (first run):
 
 ```sh
-pip install -r requirements.txt
-cp .env.example .env
-# Edit .env, fill in ANTHROPIC_API_KEY and MODEL_ID
+dotnet build
+cp s01_agent_loop/appsettings.example.json s01_agent_loop/appsettings.json
+# Edit s01_agent_loop/appsettings.json, replace PUT-YOUR-KEY-HERE with your DeepSeek API key
+# Or set env var DEEPSEEK_API_KEY=sk-...
 ```
 
 **Run**:
 
 ```sh
-python s01_agent_loop/code.py
+dotnet run --project s01_agent_loop
 ```
 
 Try these prompts:

@@ -8,7 +8,7 @@
 
 ## Problem
 
-s03's TodoManager is a flat checklist in memory: no ordering, no dependencies, no status beyond done-or-not. Real goals have structure -- task B depends on task A, tasks C and D can run in parallel, task E waits for both C and D.
+s03's TodoState is a flat checklist in memory: no ordering, no dependencies, no status beyond done-or-not. Real goals have structure -- task B depends on task A, tasks C and D can run in parallel, task E waits for both C and D.
 
 Without explicit relationships, the agent can't tell what's ready, what's blocked, or what can run concurrently. And because the list lives only in memory, context compression (s06) wipes it clean.
 
@@ -22,10 +22,10 @@ Promote the checklist into a **task graph** persisted to disk. Each task is a JS
 
 ```
 .tasks/
-  task_1.json  {"id":1, "status":"completed"}
-  task_2.json  {"id":2, "blockedBy":[1], "status":"pending"}
-  task_3.json  {"id":3, "blockedBy":[1], "status":"pending"}
-  task_4.json  {"id":4, "blockedBy":[2,3], "status":"pending"}
+  task_<ts>_<rand>.json  {"id":"task_...", "status":"completed"}
+  task_<ts>_<rand>.json  {"id":"task_...", "blockedBy":["task_..."], "status":"pending"}
+  task_<ts>_<rand>.json  {"id":"task_...", "blockedBy":["task_..."], "status":"pending"}
+  task_<ts>_<rand>.json  {"id":"task_...", "blockedBy":["task_..."], "status":"pending"}
 
 Task graph (DAG):
                  +----------+
@@ -48,62 +48,78 @@ This task graph becomes the coordination backbone for everything after s07: back
 
 ## How It Works
 
-1. **TaskManager**: one JSON file per task, CRUD with dependency graph.
+1. **`TaskStore`**: one JSON file per task, CRUD with dependency graph (`AgentCommon/Tasks/TaskSystem.cs`).
 
-```python
-class TaskManager:
-    def __init__(self, tasks_dir: Path):
-        self.dir = tasks_dir
-        self.dir.mkdir(exist_ok=True)
-        self._next_id = self._max_id() + 1
+```csharp
+public sealed class TaskStore
+{
+    private readonly string _tasksDir;
 
-    def create(self, subject, description=""):
-        task = {"id": self._next_id, "subject": subject,
-                "status": "pending", "blockedBy": [],
-                "owner": ""}
-        self._save(task)
-        self._next_id += 1
-        return json.dumps(task, indent=2)
+    public TaskStore(string workDir)
+    {
+        _tasksDir = Path.Combine(workDir, ".tasks");
+        Directory.CreateDirectory(_tasksDir);
+    }
+
+    public TaskRecord Create(string subject, string description = "",
+                             IEnumerable<string>? blockedBy = null)
+    {
+        var id = $"task_{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}_{Random.Shared.Next(0, 9999):D4}";
+        var task = new TaskRecord
+        {
+            Id = id,
+            Subject = subject,
+            Description = description,
+            Status = "pending",
+            BlockedBy = blockedBy?.ToList() ?? new(),
+        };
+        Save(task);
+        return task;
+    }
+}
 ```
 
-2. **Dependency resolution**: completing a task clears its ID from every other task's `blockedBy` list, automatically unblocking dependents.
+2. **Dependency resolution**: completing a task automatically unblocks dependents that were waiting on it.
 
-```python
-def _clear_dependency(self, completed_id):
-    for f in self.dir.glob("task_*.json"):
-        task = json.loads(f.read_text())
-        if completed_id in task.get("blockedBy", []):
-            task["blockedBy"].remove(completed_id)
-            self._save(task)
+```csharp
+public (bool ok, string message, IReadOnlyList<TaskRecord> unblocked) Complete(string id)
+{
+    var task = Load(id);
+    if (task.Status != "in_progress")
+        return (false, $"Task {id} is {task.Status}, cannot complete", Array.Empty<TaskRecord>());
+
+    task.Status = "completed";
+    Save(task);
+
+    var unblocked = List()
+        .Where(t => t.Status == "pending"
+                 && t.BlockedBy.Count > 0
+                 && CanStart(t))
+        .ToList();
+    return (true, $"Completed {task.Id} ({task.Subject})", unblocked);
+}
 ```
 
-3. **Status + dependency wiring**: `update` handles transitions and dependency edges.
+3. **Status + dependency wiring**: `Claim` and `CanStart` enforce the edges.
 
-```python
-def update(self, task_id, status=None,
-           add_blocked_by=None, remove_blocked_by=None):
-    task = self._load(task_id)
-    if status:
-        task["status"] = status
-        if status == "completed":
-            self._clear_dependency(task_id)
-    if add_blocked_by:
-        task["blockedBy"] = list(set(task["blockedBy"] + add_blocked_by))
-    if remove_blocked_by:
-        task["blockedBy"] = [x for x in task["blockedBy"] if x not in remove_blocked_by]
-    self._save(task)
+```csharp
+public bool CanStart(TaskRecord task)
+{
+    foreach (var depId in task.BlockedBy)
+    {
+        var dep = Load(depId);
+        if (dep.Status != "completed") return false;
+    }
+    return true;
+}
 ```
 
 4. Four task tools go into the dispatch map.
 
-```python
-TOOL_HANDLERS = {
-    # ...base tools...
-    "task_create": lambda **kw: TASKS.create(kw["subject"]),
-    "task_update": lambda **kw: TASKS.update(kw["task_id"], kw.get("status")),
-    "task_list":   lambda **kw: TASKS.list_all(),
-    "task_get":    lambda **kw: TASKS.get(kw["task_id"]),
-}
+```csharp
+var store = new TaskStore(workDir);
+TaskTools.Register(tools, store, msg => Console.WriteLine(msg));
+// → registers: create_task, list_tasks, get_task, claim_task, complete_task
 ```
 
 From s07 onward, the task graph is the default for multi-step work. s03's Todo remains for quick single-session checklists.
@@ -112,7 +128,7 @@ From s07 onward, the task graph is the default for multi-step work. s03's Todo r
 
 | Component | Before (s06) | After (s07) |
 |---|---|---|
-| Tools | 5 | 8 (`task_create/update/list/get`) |
+| Tools | 5 | 9 (+create/list/get/claim/complete) |
 | Planning model | Flat checklist (in-memory) | Task graph with dependencies (on disk) |
 | Relationships | None | `blockedBy` edges |
 | Status tracking | Done or not | `pending` -> `in_progress` -> `completed` |
@@ -121,8 +137,8 @@ From s07 onward, the task graph is the default for multi-step work. s03's Todo r
 ## Try It
 
 ```sh
-cd learn-claude-code
-python agents/s07_task_system.py
+cd learn-claude-code-csharp
+dotnet run --project s12_task_system
 ```
 
 1. `Create 3 tasks: "Setup project", "Write code", "Write tests". Make them depend on each other in order.`

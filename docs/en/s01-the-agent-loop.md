@@ -29,88 +29,85 @@ One exit condition controls the entire flow. The loop runs until the model stops
 
 1. User prompt becomes the first message.
 
-```python
-messages.append({"role": "user", "content": query})
+```csharp
+messages.Add(Message.UserText(query));
 ```
 
 2. Send messages + tool definitions to the LLM.
 
-```python
-response = client.messages.create(
-    model=MODEL, system=SYSTEM, messages=messages,
-    tools=TOOLS, max_tokens=8000,
-)
+```csharp
+var response = await client.CreateMessageAsync(
+    system, messages, tools.AllSpecs().ToList(), maxTokens: 8000);
 ```
 
 3. Append the assistant response. Check `stop_reason` -- if the model didn't call a tool, we're done.
 
-```python
-messages.append({"role": "assistant", "content": response.content})
-if response.stop_reason != "tool_use":
-    return
+```csharp
+messages.Add(Message.Assistant(response.Content));
+if (response.StopReason != "tool_use")
+    return response;
 ```
 
 4. Execute each tool call, collect results, append as a user message. Loop back to step 2.
 
-```python
-results = []
-for block in response.content:
-    if block.type == "tool_use":
-        output = run_bash(block.input["command"])
-        results.append({
-            "type": "tool_result",
-            "tool_use_id": block.id,
-            "content": output,
-        })
-messages.append({"role": "user", "content": results})
+```csharp
+var results = new List<ToolResultBlock>();
+foreach (var block in response.Content.OfType<ToolUseBlock>())
+{
+    var output = tools.Invoke(block.Name, block.Input);
+    results.Add(new ToolResultBlock(block.Id, output));
+}
+messages.Add(Message.UserToolResults(results));
 ```
 
-Assembled into one function:
+Assembled into one function (`AgentCommon/Agent/AgentHarness.cs`):
 
-```python
-def agent_loop(query):
-    messages = [{"role": "user", "content": query}]
-    while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
-        )
-        messages.append({"role": "assistant", "content": response.content})
+```csharp
+public async Task<LlmResponse> RunAsync(
+    List<Message> messages, int? maxTokensOverride = null, CancellationToken ct = default)
+{
+    Hooks.FireBeforeLlmCall(messages);
+    Compactor.PrepareBeforeLlm(messages);
 
-        if response.stop_reason != "tool_use":
-            return
+    var systemPrompt = SystemPromptProvider?.Invoke() ?? "";
+    var response = await Client.CreateMessageAsync(
+        systemPrompt, messages, Tools.AllSpecs().ToList(),
+        maxTokensOverride, modelOverride: null, ct);
+    messages.Add(Message.Assistant(response.Content));
 
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                output = run_bash(block.input["command"])
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": output,
-                })
-        messages.append({"role": "user", "content": results})
+    if (response.StopReason != "tool_use")
+        return response;
+
+    var results = new List<ToolResultBlock>();
+    foreach (var block in response.Content.OfType<ToolUseBlock>())
+    {
+        var output = Tools.Invoke(block.Name, block.Input);
+        results.Add(new ToolResultBlock(block.Id, output));
+    }
+    messages.Add(Message.UserToolResults(results));
+    return response;
+}
 ```
 
-That's the entire agent in under 30 lines. Everything else in this course layers on top -- without changing the loop.
+That's the entire agent. Everything else in this course layers on top -- without changing the loop.
 
 ## What Changed
 
 | Component     | Before     | After                          |
 |---------------|------------|--------------------------------|
-| Agent loop    | (none)     | `while True` + stop_reason     |
+| Agent loop    | (none)     | `while stop_reason == "tool_use"` |
 | Tools         | (none)     | `bash` (one tool)              |
 | Messages      | (none)     | Accumulating list              |
-| Control flow  | (none)     | `stop_reason != "tool_use"`    |
+| Control flow  | (none)     | `StopReason != "tool_use"`     |
 
 ## Try It
 
 ```sh
-cd learn-claude-code
-python agents/s01_agent_loop.py
+cd learn-claude-code-csharp
+dotnet run --project s01_agent_loop
 ```
 
-1. `Create a file called hello.py that prints "Hello, World!"`
-2. `List all Python files in this directory`
+1. `Create a file called hello.cs that prints "Hello, World!"`
+2. `List all C# files in this directory`
 3. `What is the current git branch?`
 4. `Create a directory called test_output and write 3 files in it`

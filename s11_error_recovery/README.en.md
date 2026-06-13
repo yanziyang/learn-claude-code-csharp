@@ -177,7 +177,7 @@ The outer try/except catches API exceptions (prompt_too_long, etc.), `with_retry
 
 ```sh
 cd learn-claude-code
-python s11_error_recovery/code.py
+dotnet run --project s11_error_recovery
 ```
 
 Try these prompts:

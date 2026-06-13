@@ -10,7 +10,7 @@
 
 In s09, teammates work and communicate but lack structured coordination:
 
-**Shutdown**: Killing a thread leaves files half-written and config.json stale. You need a handshake: the lead requests, the teammate approves (finish and exit) or rejects (keep working).
+**Shutdown**: Killing a thread leaves files half-written and bus state stale. You need a handshake: the lead requests, the teammate approves (finish and exit) or rejects (keep working).
 
 **Plan approval**: When the lead says "refactor the auth module," the teammate starts immediately. For high-risk changes, the lead should review the plan first.
 
@@ -42,42 +42,55 @@ Trackers:
 
 ## How It Works
 
-1. The lead initiates shutdown by generating a request_id and sending through the inbox.
+1. The lead initiates shutdown by generating a `request_id` and sending it through the inbox.
 
-```python
-shutdown_requests = {}
+```csharp
+var shutdownRequests = new ConcurrentDictionary<string, ShutdownRequest>();
 
-def handle_shutdown_request(teammate: str) -> str:
-    req_id = str(uuid.uuid4())[:8]
-    shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
-    BUS.send("lead", teammate, "Please shut down gracefully.",
-             "shutdown_request", {"request_id": req_id})
-    return f"Shutdown request {req_id} sent (status: pending)"
+void HandleShutdownRequest(string teammate)
+{
+    var reqId = $"shr_{Guid.NewGuid():N}"[..11];
+    shutdownRequests[reqId] = new ShutdownRequest(teammate, "pending");
+    bus.Send("lead", teammate, "Please shut down gracefully.",
+             "shutdown_request", new Dictionary<string, object>
+             {
+                 ["request_id"] = reqId,
+             });
+}
 ```
 
 2. The teammate receives the request and responds with approve/reject.
 
-```python
-if tool_name == "shutdown_response":
-    req_id = args["request_id"]
-    approve = args["approve"]
-    shutdown_requests[req_id]["status"] = "approved" if approve else "rejected"
-    BUS.send(sender, "lead", args.get("reason", ""),
-             "shutdown_response",
-             {"request_id": req_id, "approve": approve})
+```csharp
+// In the teammate's tool handler:
+if (toolName == "shutdown_response")
+{
+    var reqId = args["request_id"];
+    var approve = (bool)args["approve"];
+    shutdownRequests[reqId].Status = approve ? "approved" : "rejected";
+    bus.Send(teammateName, "lead", args.GetValueOrDefault("reason", ""),
+             "shutdown_response", new Dictionary<string, object>
+             {
+                 ["request_id"] = reqId,
+                 ["approve"] = approve,
+             });
+}
 ```
 
-3. Plan approval follows the identical pattern. The teammate submits a plan (generating a request_id), the lead reviews (referencing the same request_id).
+3. Plan approval follows the identical pattern. The teammate submits a plan (generating a `request_id`), the lead reviews (referencing the same `request_id`).
 
-```python
-plan_requests = {}
-
-def handle_plan_review(request_id, approve, feedback=""):
-    req = plan_requests[request_id]
-    req["status"] = "approved" if approve else "rejected"
-    BUS.send("lead", req["from"], feedback,
-             "plan_approval_response",
-             {"request_id": request_id, "approve": approve})
+```csharp
+void HandlePlanReview(string requestId, bool approve, string feedback = "")
+{
+    var req = planRequests[requestId];
+    req.Status = approve ? "approved" : "rejected";
+    bus.Send("lead", req.From, feedback,
+             "plan_approval_response", new Dictionary<string, object>
+             {
+                 ["request_id"] = requestId,
+                 ["approve"] = approve,
+             });
+}
 ```
 
 One FSM, two applications. The same `pending -> approved | rejected` state machine handles any request-response protocol.
@@ -95,8 +108,8 @@ One FSM, two applications. The same `pending -> approved | rejected` state machi
 ## Try It
 
 ```sh
-cd learn-claude-code
-python agents/s10_team_protocols.py
+cd learn-claude-code-csharp
+dotnet run --project s16_team_protocols
 ```
 
 1. `Spawn alice as a coder. Then request her shutdown.`

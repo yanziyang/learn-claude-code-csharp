@@ -201,7 +201,7 @@ Shutdown handshake complete: request → confirm → shutdown. Every step tracke
 
 ```sh
 cd learn-claude-code
-python s16_team_protocols/code.py
+dotnet run --project s16_team_protocols
 ```
 
 Try these prompts:

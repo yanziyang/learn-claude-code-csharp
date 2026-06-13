@@ -19,94 +19,98 @@ Teammate lifecycle:
   spawn -> WORKING -> IDLE -> WORKING -> ... -> SHUTDOWN
 
 Communication:
-  .team/
-    config.json           <- team roster + statuses
-    inbox/
-      alice.jsonl         <- append-only, drain-on-read
-      bob.jsonl
-      lead.jsonl
+  .mailboxes/
+    lead.jsonl            <- append-only, drain-on-read
+    alice.jsonl
+    bob.jsonl
 
-              +--------+    send("alice","bob","...")    +--------+
+              +--------+    bus.Send("alice","bob","...")   +--------+
               | alice  | -----------------------------> |  bob   |
               | loop   |    bob.jsonl << {json_line}    |  loop  |
               +--------+                                +--------+
                    ^                                         |
-                   |        BUS.read_inbox("alice")          |
+                   |        bus.ReadInbox("alice")          |
                    +---- alice.jsonl -> read + drain ---------+
 ```
 
 ## 仕組み
 
-1. TeammateManagerがconfig.jsonでチーム名簿を管理する。
+1. `MessageBus` は `.mailboxes/` 配下にエージェントごとに1つのJSONLファイルを書き出す (`AgentCommon/Teams/MessageBus.cs`)。
 
-```python
-class TeammateManager:
-    def __init__(self, team_dir: Path):
-        self.dir = team_dir
-        self.dir.mkdir(exist_ok=True)
-        self.config_path = self.dir / "config.json"
-        self.config = self._load_config()
-        self.threads = {}
+```csharp
+public sealed class MessageBus
+{
+    private readonly string _mailboxDir;
+
+    public MessageBus(string workDir, Action<string>? onLog = null)
+    {
+        _mailboxDir = Path.Combine(workDir, ".mailboxes");
+        Directory.CreateDirectory(_mailboxDir);
+    }
+
+    public void Send(string from, string to, string content, string msgType = "message")
+    {
+        var msg = new MailboxMessage
+        {
+            From = from, To = to, Content = content, Type = msgType,
+            Ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0,
+        };
+        var inbox = Path.Combine(_mailboxDir, $"{to}.jsonl");
+        lock (_lock)
+        {
+            File.AppendAllText(inbox, JsonSerializer.Serialize(msg) + "\n");
+        }
+    }
+}
 ```
 
-2. `spawn()`がチームメイトを作成し、そのエージェントループをスレッドで開始する。
+2. `ReadInbox` はインボックス全体を1回の呼び出しで消費する: 全行を読み、ファイルを削除。
 
-```python
-def spawn(self, name: str, role: str, prompt: str) -> str:
-    member = {"name": name, "role": role, "status": "working"}
-    self.config["members"].append(member)
-    self._save_config()
-    thread = threading.Thread(
-        target=self._teammate_loop,
-        args=(name, role, prompt), daemon=True)
-    thread.start()
-    return f"Spawned teammate '{name}' (role: {role})"
+```csharp
+public List<MailboxMessage> ReadInbox(string agent)
+{
+    var inbox = Path.Combine(_mailboxDir, $"{agent}.jsonl");
+    if (!File.Exists(inbox)) return new List<MailboxMessage>();
+
+    List<MailboxMessage> msgs;
+    lock (_lock)
+    {
+        var lines = File.ReadAllText(inbox).Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        msgs = lines.Select(l => JsonSerializer.Deserialize<MailboxMessage>(l)!).ToList();
+        File.Delete(inbox);   // 消費: 読み取り + 削除
+    }
+    return msgs;
+}
 ```
 
-3. MessageBus: 追記専用のJSONLインボックス。`send()`がJSON行を追記し、`read_inbox()`がすべて読み取ってドレインする。
+3. `TeamTools` がリード側に3つのツールを登録する: `spawn_teammate`, `send_message`, `check_inbox`。
 
-```python
-class MessageBus:
-    def send(self, sender, to, content, msg_type="message", extra=None):
-        msg = {"type": msg_type, "from": sender,
-               "content": content, "timestamp": time.time()}
-        if extra:
-            msg.update(extra)
-        with open(self.dir / f"{to}.jsonl", "a") as f:
-            f.write(json.dumps(msg) + "\n")
-
-    def read_inbox(self, name):
-        path = self.dir / f"{name}.jsonl"
-        if not path.exists(): return "[]"
-        msgs = [json.loads(l) for l in path.read_text().strip().splitlines() if l]
-        path.write_text("")  # drain
-        return json.dumps(msgs, indent=2)
+```csharp
+var bus = new MessageBus(workDir);
+TeamTools.Register(tools, bus, client, config, workDir);
+// → spawn_teammate: バックグラウンドスレッドで TeammateRunner を起動
+// → send_message:  bus.Send("lead", to, content)
+// → check_inbox:   bus.ReadInbox("lead") (ドレイン)
 ```
 
-4. 各チームメイトは各LLM呼び出しの前にインボックスを確認し、受信メッセージをコンテキストに注入する。
+4. 各 `TeammateRunner` は各LLM呼び出しの前に自身のインボックスを確認し、受信メッセージをコンテキストに注入する。
 
-```python
-def _teammate_loop(self, name, role, prompt):
-    messages = [{"role": "user", "content": prompt}]
-    for _ in range(50):
-        inbox = BUS.read_inbox(name)
-        if inbox != "[]":
-            messages.append({"role": "user",
-                "content": f"<inbox>{inbox}</inbox>"})
-        response = client.messages.create(...)
-        if response.stop_reason != "tool_use":
-            break
-        # execute tools, append results...
-    self._find_member(name)["status"] = "idle"
+```csharp
+// TeammateRunner フック内 (要約):
+var msgs = bus.ReadInbox(name);
+if (msgs.Count > 0)
+    messages.Add(Message.UserText(
+        "<inbox>\n" + JsonSerializer.Serialize(msgs, new JsonSerializerOptions { WriteIndented = true })
+        + "\n</inbox>"));
 ```
 
 ## s08からの変更点
 
 | Component      | Before (s08)     | After (s09)                |
 |----------------|------------------|----------------------------|
-| Tools          | 6                | 9 (+spawn/send/read_inbox) |
+| Tools          | 6                | 9 (+spawn/send/check_inbox)|
 | Agents         | Single           | Lead + N teammates         |
-| Persistence    | None             | config.json + JSONL inboxes|
+| Persistence    | None             | JSONL inboxes under .mailboxes/ |
 | Threads        | Background cmds  | Full agent loops per thread|
 | Lifecycle      | Fire-and-forget  | idle -> working -> idle    |
 | Communication  | None             | message + broadcast        |
@@ -114,8 +118,8 @@ def _teammate_loop(self, name, role, prompt):
 ## 試してみる
 
 ```sh
-cd learn-claude-code
-python agents/s09_agent_teams.py
+cd learn-claude-code-csharp
+dotnet run --project s15_agent_teams
 ```
 
 1. `Spawn alice (coder) and bob (tester). Have alice send bob a message.`

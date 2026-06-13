@@ -174,7 +174,7 @@ At the start of each loop iteration, get the system prompt. If context changed, 
 
 ```sh
 cd learn-claude-code
-python s10_system_prompt/code.py
+dotnet run --project s10_system_prompt
 ```
 
 What to watch for:
@@ -187,7 +187,7 @@ Try these prompts:
 
 1. `Read the file README.md` (observe the three always-loaded sections)
 2. `Create a file called .memory/MEMORY.md with content "- [test](test.md) — test memory"` (write a memory index)
-3. `Read the file code.py` (observe whether the memory section appears)
+3. `Read the file Program.cs` (observe whether the memory section appears)
 
 ---
 

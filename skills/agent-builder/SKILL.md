@@ -108,14 +108,6 @@ The pattern is universal. Only the capabilities change.
 **Philosophy & Theory**:
 - `references/agent-philosophy.md` - Deep dive into why agents work
 
-**Implementation**:
-- `references/minimal-agent.py` - Complete working agent (~80 lines)
-- `references/tool-templates.py` - Capability definitions
-- `references/subagent-pattern.py` - Context isolation
-
-**Scaffolding**:
-- `scripts/init_agent.py` - Generate new agent projects
-
 ## The Agent Mindset
 
 **From**: "How do I make the system do X?"

@@ -31,7 +31,7 @@ When model calls load_skill("git"):
 +--------------------------------------+
 ```
 
-第1層: スキル*名*をシステムプロンプトに(低コスト)。第2層: スキル*本体*をtool_resultに(オンデマンド)。
+第1層: スキル*名*をシステムプロンプトに(低コスト)。第2層: スキル*本体*を tool_result に(オンデマンド)。
 
 ## 仕組み
 
@@ -40,48 +40,48 @@ When model calls load_skill("git"):
 ```
 skills/
   pdf/
-    SKILL.md       # ---\n name: pdf\n description: Process PDF files\n ---\n ...
+    SKILL.md       # ---\nname: pdf\ndescription: Process PDF files\n---\n...
   code-review/
-    SKILL.md       # ---\n name: code-review\n description: Review code\n ---\n ...
+    SKILL.md       # ---\nname: code-review\ndescription: Review code\n---\n...
 ```
 
-2. SkillLoaderが `SKILL.md` を再帰的に探索し、ディレクトリ名をスキル識別子として使用する。
+2. `SkillRegistry` が `SKILL.md` を再帰的に探索し、frontmatter をパースしてディレクトリ名をスキル識別子として使用する (`AgentCommon/Skills/SkillRegistry.cs`)。
 
-```python
-class SkillLoader:
-    def __init__(self, skills_dir: Path):
-        self.skills = {}
-        for f in sorted(skills_dir.rglob("SKILL.md")):
-            text = f.read_text()
-            meta, body = self._parse_frontmatter(text)
-            name = meta.get("name", f.parent.name)
-            self.skills[name] = {"meta": meta, "body": body}
+```csharp
+public static SkillRegistry LoadFromDir(string skillsDir)
+{
+    var reg = new SkillRegistry();
+    if (!Directory.Exists(skillsDir)) return reg;
 
-    def get_descriptions(self) -> str:
-        lines = []
-        for name, skill in self.skills.items():
-            desc = skill["meta"].get("description", "")
-            lines.append(f"  - {name}: {desc}")
-        return "\n".join(lines)
+    foreach (var dir in Directory.EnumerateDirectories(skillsDir))
+    {
+        var manifest = Path.Combine(dir, "SKILL.md");
+        if (!File.Exists(manifest)) continue;
 
-    def get_content(self, name: str) -> str:
-        skill = self.skills.get(name)
-        if not skill:
-            return f"Error: Unknown skill '{name}'."
-        return f"<skill name=\"{name}\">\n{skill['body']}\n</skill>"
+        var raw = File.ReadAllText(manifest);
+        var (name, desc) = ParseFrontmatter(raw);
+        if (string.IsNullOrEmpty(name)) name = Path.GetFileName(dir);
+        reg._byName[name] = new SkillManifest
+        {
+            Name = name,
+            Description = desc,
+            FullContent = raw,
+        };
+    }
+    return reg;
+}
 ```
 
 3. 第1層はシステムプロンプトに配置。第2層は通常のツールハンドラ。
 
-```python
-SYSTEM = f"""You are a coding agent at {WORKDIR}.
-Skills available:
-{SKILL_LOADER.get_descriptions()}"""
+```csharp
+var skills = SkillRegistry.LoadFromDir(skillsDir);
 
-TOOL_HANDLERS = {
-    # ...base tools...
-    "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
-}
+var system = $"You are a coding agent at {workDir}.\n" +
+             $"Skills available:\n{skills.Catalog()}";
+
+SkillTools.Register(tools, skills);
+// → "load_skill" ツールを登録し、SkillManifest.FullContent を返す
 ```
 
 モデルはどのスキルが存在するかを知り(低コスト)、関連する時にだけ読み込む(高コスト)。
@@ -92,14 +92,14 @@ TOOL_HANDLERS = {
 |----------------|------------------|----------------------------|
 | Tools          | 5 (base + task)  | 5 (base + load_skill)      |
 | System prompt  | Static string    | + skill descriptions       |
-| Knowledge      | None             | skills/\*/SKILL.md files   |
+| Knowledge      | None             | skills/*/SKILL.md files    |
 | Injection      | None             | Two-layer (system + result)|
 
 ## 試してみる
 
 ```sh
-cd learn-claude-code
-python agents/s05_skill_loading.py
+cd learn-claude-code-csharp
+dotnet run --project s07_skill_loading
 ```
 
 1. `What skills are available?`

@@ -22,11 +22,11 @@
                     +----------------+
                           |
               +-----------+-----------+
-              | TodoManager state     |
+              | TodoState              |
               | [ ] task A            |
               | [>] task B  <- doing  |
               | [x] task C            |
-              +-----------	------------+
+              +-----------------------+
                           |
               if rounds_since_todo >= 3:
                 inject <reminder> into tool_result
@@ -34,65 +34,77 @@
 
 ## 工作原理
 
-1. TodoManager 存储带状态的项目。同一时间只允许一个 `in_progress`。
+1. `TodoState` 存储带状态的项目。同一时间只允许一个 `in_progress`。
 
-```python
-class TodoManager:
-    def update(self, items: list) -> str:
-        validated, in_progress_count = [], 0
-        for item in items:
-            status = item.get("status", "pending")
-            if status == "in_progress":
-                in_progress_count += 1
-            validated.append({"id": item["id"], "text": item["text"],
-                              "status": status})
-        if in_progress_count > 1:
-            raise ValueError("Only one task can be in_progress")
-        self.items = validated
-        return self.render()
-```
+```csharp
+public sealed class TodoState
+{
+    public List<TodoItem> Items { get; private set; } = new();
+    public event Action? Changed;
 
-2. `todo` 工具和其他工具一样加入 dispatch map。
+    public void Update(List<TodoItem> items)
+    {
+        Items = items;
+        Changed?.Invoke();
+    }
 
-```python
-TOOL_HANDLERS = {
-    # ...base tools...
-    "todo": lambda **kw: TODO.update(kw["items"]),
+    public void Render()
+    {
+        Console.WriteLine("\n## Current Tasks");
+        foreach (var t in Items)
+        {
+            var icon = t.status switch
+            {
+                "completed"   => "x",
+                "in_progress" => ">",
+                _             => " ",
+            };
+            Console.WriteLine($"  [{icon}] {t.content}");
+        }
+    }
 }
 ```
 
-3. nag reminder: 模型连续 3 轮以上不调用 `todo` 时注入提醒。
+2. `todo_write` 工具和其他工具一样加入注册。
 
-```python
-if rounds_since_todo >= 3 and messages:
-    last = messages[-1]
-    if last["role"] == "user" and isinstance(last.get("content"), list):
-        last["content"].insert(0, {
-            "type": "text",
-            "text": "<reminder>Update your todos.</reminder>",
-        })
+```csharp
+var todos = new TodoTools.TodoState();
+TodoTools.Register(tools, todos);
 ```
 
-"同时只能有一个 in_progress" 强制顺序聚焦。nag reminder 制造问责压力 -- 你不更新计划, 系统就追着你问。
+3. 更新后, 渲染结果以 `tool_result` 形式回显给模型, 让模型和用户看到同一份视图。
+
+```csharp
+tools.Register("todo_write", "Create and manage a task list for your current coding session.",
+    /* schema */, input =>
+    {
+        var items = ParseTodos(input);
+        state.Update(items);
+        state.Render();      // 同一视图回灌到模型上下文
+        return $"Updated {items.Count} tasks";
+    });
+```
+
+"同时只能有一个 in_progress" 强制顺序聚焦。回显到 result 制造问责压力。
 
 ## 相对 s02 的变更
 
 | 组件           | 之前 (s02)       | 之后 (s03)                     |
 |----------------|------------------|--------------------------------|
-| Tools          | 4                | 5 (+todo)                      |
-| 规划           | 无               | 带状态的 TodoManager           |
-| Nag 注入       | 无               | 3 轮后注入 `<reminder>`        |
-| Agent loop     | 简单分发         | + rounds_since_todo 计数器     |
+| Tools          | 4                | 5 (+todo_write)                |
+| 规划           | 无               | `TodoState` with statuses      |
+| 回显           | 无               | 渲染结果写入 result            |
+| Agent loop     | 简单分发         | 不变                           |
 
 ## 试一试
 
 ```sh
-cd learn-claude-code
-python agents/s03_todo_write.py
+cd learn-claude-code-csharp
+dotnet run --project s05_todo_write
 ```
 
 试试这些 prompt (英文 prompt 对 LLM 效果更好, 也可以用中文):
 
-1. `Refactor the file hello.py: add type hints, docstrings, and a main guard`
-2. `Create a Python package with __init__.py, utils.py, and tests/test_utils.py`
-3. `Review all Python files and fix any style issues`
+1. `Refactor the file hello.cs: add XML doc comments and a main guard`
+2. `Create a small class library with Class1.cs, Utils.cs, and tests/UtilsTests.cs`
+3. `Review all C# files in this project and fix any obvious style issues`
