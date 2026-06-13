@@ -42,24 +42,44 @@ s06 的子 Agent 是临时工，叫来干一件事就走了。但有些任务需
 
 每个 Agent（包括 Lead 和队友）有一个 `.jsonl` 邮箱。发消息 = 往对方的文件里 append 一行 JSON。读消息 = 读文件 + 删除（消费式）：
 
-```python
-class MessageBus:
-    def send(self, from_agent: str, to_agent: str,
-             content: str, msg_type: str = "message"):
-        msg = {"from": from_agent, "to": to_agent,
-               "content": content, "type": msg_type,
-               "ts": time.time()}
-        inbox = MAILBOX_DIR / f"{to_agent}.jsonl"
-        with open(inbox, "a") as f:
-            f.write(json.dumps(msg) + "\n")
+```csharp
+public sealed class MessageBus
+{
+    private readonly string _mailboxDir;
+    private readonly object _lock = new();
 
-    def read_inbox(self, agent: str) -> list[dict]:
-        inbox = MAILBOX_DIR / f"{agent}.jsonl"
-        if not inbox.exists():
-            return []
-        msgs = [json.loads(line) for line in inbox.read_text().splitlines()]
-        inbox.unlink()  # 消费式：读完删除
-        return msgs
+    public void Send(string from, string to, string content, string msgType = "message")
+    {
+        var msg = new MailboxMessage
+        {
+            From = from,
+            To = to,
+            Content = content,
+            Type = msgType,
+            Ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0,
+        };
+        var inbox = Path.Combine(_mailboxDir, $"{to}.jsonl");
+        lock (_lock)
+        {
+            File.AppendAllText(inbox, JsonSerializer.Serialize(msg) + "\n");
+        }
+    }
+
+    public List<MailboxMessage> ReadInbox(string agent)
+    {
+        var inbox = Path.Combine(_mailboxDir, $"{agent}.jsonl");
+        if (!File.Exists(inbox)) return new List<MailboxMessage>();
+        lock (_lock)
+        {
+            var msgs = File.ReadAllText(inbox)
+                .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                .Select(l => JsonSerializer.Deserialize<MailboxMessage>(l)!)
+                .ToList();
+            File.Delete(inbox);  // consume: read + delete
+            return msgs;
+        }
+    }
+}
 ```
 
 为什么用文件而不是内存队列？教学版选文件是因为直观、跨线程可观察。真实 CC 也用文件收件箱（`~/.claude/teams/{team}/inboxes/`），但加了 `proper-lockfile` 防并发写冲突。教学版的 `read_inbox` 有 read + unlink 竞态，多线程同时读可能丢消息，对教学场景可以接受。
@@ -68,26 +88,35 @@ class MessageBus:
 
 Lead 调用 `spawn_teammate` 工具启动一个队友。队友跑在自己的 daemon 线程里，有自己的 system prompt、自己的 messages、自己的简化工具集：
 
-```python
-def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
-    system = f"You are '{name}', a {role}. Use tools to complete tasks."
+```csharp
+string SpawnTeammateThread(string name, string role, string prompt)
+{
+    var system = $"You are '{name}', a {role}. Use tools to complete tasks.";
+    var messages = new List<Message> { Message.UserText(prompt) };
+    var subTools = new ToolRegistry();
+    BashTool.Register(subTools, _workDir);
+    FileTools.Register(subTools, _workDir);
 
-    def run():
-        messages = [{"role": "user", "content": prompt}]
-        sub_tools = [bash, read_file, write_file, send_message]
-        for _ in range(10):           # 最多 10 轮
-            inbox = BUS.read_inbox(name)
-            if inbox:
-                messages.append({"role": "user",
-                    "content": f"<inbox>{json.dumps(inbox)}</inbox>"})
-            response = client.messages.create(
-                model=MODEL, system=system, messages=messages[-20:],
-                tools=sub_tools, max_tokens=8000)
-            # ... 执行工具、处理结果
-        # 完成后发 summary 给 Lead
-        BUS.send(name, "lead", summary, "result")
+    new Thread(async () =>
+    {
+        for (var i = 0; i < 10; i++)           // max 10 rounds
+        {
+            var inbox = _bus.ReadInbox(name);
+            if (inbox.Count > 0)
+            {
+                var json = JsonSerializer.Serialize(inbox);
+                messages.Add(Message.UserText($"<inbox>{json}</inbox>"));
+            }
+            var response = await _client.CreateMessageAsync(
+                system, messages, subTools.AllSpecs().ToList(), maxTokens: 8000);
+            // ... execute tools, process results
+        }
+        // Send final summary to Lead
+        _bus.Send(name, "lead", summary, "result");
+    }) { IsBackground = true }.Start();
 
-    threading.Thread(target=run, daemon=True).start()
+    return $"Spawned teammate '{name}' (role: {role})";
+}
 ```
 
 关键设计：
@@ -99,14 +128,15 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
 
 Lead 在每轮主循环结束后检查收件箱。队友发来的消息注入到 history 里，让 LLM 能看到并做出反应：
 
-```python
-# 主循环结束后
-inbox = BUS.read_inbox("lead")
-if inbox:
-    inbox_text = "\n".join(
-        f"From {m['from']}: {m['content'][:200]}" for m in inbox)
-    history.append({"role": "user",
-                    "content": f"[Inbox]\n{inbox_text}"})
+```csharp
+// After main loop iteration
+var inbox = bus.ReadInbox("lead");
+if (inbox.Count > 0)
+{
+    messages.Add(Message.UserText("<inbox>\n" +
+        JsonSerializer.Serialize(inbox, new JsonSerializerOptions { WriteIndented = true }) +
+        "\n</inbox>"));
+}
 ```
 
 教学版在用户输入循环外注入。CC 更精细，Lead 的 `useInboxPoller` 每 1 秒检查一次，有消息就提交为新的 turn，不需要等用户输入。

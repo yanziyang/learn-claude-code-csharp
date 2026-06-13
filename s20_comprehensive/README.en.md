@@ -105,11 +105,13 @@ After `connect_mcp("docs")`, the next round exposes tools like `mcp__docs__searc
 
 Permission is not hardcoded into the tool execution line. It is a `PreToolUse` hook:
 
-```python
-blocked = trigger_hooks("PreToolUse", block)
-if blocked:
-    results.append(tool_result(block.id, blocked))
-    continue
+```csharp
+var blocked = agent.Hooks.TriggerPreToolUse(block);
+if (blocked is not null)
+{
+    results.Add(new ToolResultBlock(block.Id, blocked));
+    continue;
+}
 ```
 
 That means permission, logging, and audit logic all attach to the same hook point. After execution, `PostToolUse` hooks run.
@@ -236,13 +238,15 @@ Watch for:
 
 From s01 to s20, the code gets more capable, but the core remains unchanged:
 
-```python
-while True:
-    response = LLM(messages, tools)
-    if not has_tool_use(response.content):
-        return
-    results = execute_tools(response.content)
-    messages.append(tool_results)
+```csharp
+while (true)
+{
+    var response = await client.CreateMessageAsync(system, messages, tools.AllSpecs().ToList());
+    messages.Add(Message.Assistant(response.Content));
+    if (!response.Content.OfType<ToolUseBlock>().Any()) return;
+    var results = tools.InvokeAll(response.Content.OfType<ToolUseBlock>());
+    messages.Add(Message.UserToolResults(results));
+}
 ```
 
 Claude Code's complexity is not "another agent brain." It is the complexity of a mature harness. The model decides and chooses actions; the harness organizes environment, tools, permissions, memory, teams, and external capabilities.

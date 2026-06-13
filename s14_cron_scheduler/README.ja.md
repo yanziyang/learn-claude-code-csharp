@@ -51,14 +51,15 @@ cron スケジューリングは 4 層に分かれる：
 
 各 cron タスクは `CronJob` オブジェクト：
 
-```python
-@dataclass
-class CronJob:
-    id: str
-    cron: str        # "0 9 * * *"（5 フィールド cron 式）
-    prompt: str      # 発火時に Agent に注入するメッセージ
-    recurring: bool  # True=定期的、False=一回限り
-    durable: bool    # True=ディスク書き込み、セッション横断
+```csharp
+public sealed class CronJob
+{
+    public string Id { get; set; } = "";
+    public string Cron { get; set; } = "";       // "0 9 * * *" (5-field cron expression)
+    public string Prompt { get; set; } = "";     // Message injected to the agent when fired
+    public bool Recurring { get; set; } = true;  // True=recurring, False=one-shot
+    public bool Durable { get; set; } = true;    // True=write to disk, survives sessions
+}
 ```
 
 cron 式、5 フィールド、Unix で 50 年使われている：
@@ -77,57 +78,67 @@ cron 式、5 フィールド、Unix で 50 年使われている：
 
 標準 cron セマンティクス：分、時、月はすべてマッチ必須。日（DOM）と曜日（DOW）が両方制約されている場合は、いずれかのマッチで十分（OR）：
 
-```python
-def cron_matches(cron_expr: str, dt: datetime) -> bool:
-    fields = cron_expr.strip().split()
-    if len(fields) != 5:
-        return False
-    minute, hour, dom, month, dow = fields
-    dow_val = (dt.weekday() + 1) % 7  # Python Monday=0 → cron Sunday=0
+```csharp
+public static bool CronMatches(string cronExpr, DateTime dt)
+{
+    var fields = cronExpr.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+    if (fields.Length != 5) return false;
+    var minute = fields[0];
+    var hour = fields[1];
+    var dom = fields[2];
+    var month = fields[3];
+    var dow = fields[4];
+    var dowVal = (dt.DayOfWeek == DayOfWeek.Sunday) ? 0 : (int)dt.DayOfWeek;
 
-    m = _cron_field_matches(minute, dt.minute)
-    h = _cron_field_matches(hour, dt.hour)
-    dom_ok = _cron_field_matches(dom, dt.day)
-    month_ok = _cron_field_matches(month, dt.month)
-    dow_ok = _cron_field_matches(dow, dow_val)
+    if (!FieldMatches(minute, dt.Minute, 0, 59)) return false;
+    if (!FieldMatches(hour, dt.Hour, 0, 23)) return false;
+    if (!FieldMatches(month, dt.Month, 1, 12)) return false;
+    var domOk = FieldMatches(dom, dt.Day, 1, 31);
+    var dowOk = FieldMatches(dow, dowVal, 0, 6);
 
-    if not (m and h and month_ok):
-        return False
-    # DOM and DOW: both constrained → either matching is enough (OR)
-    dom_unconstrained = dom == "*"
-    dow_unconstrained = dow == "*"
-    if dom_unconstrained and dow_unconstrained:
-        return True
-    if dom_unconstrained:
-        return dow_ok
-    if dow_unconstrained:
-        return dom_ok
-    return dom_ok or dow_ok
+    // DOM and DOW: both constrained → either matching is enough (OR)
+    var domFree = dom == "*";
+    var dowFree = dow == "*";
+    if (domFree && dowFree) return true;
+    if (domFree) return dowOk;
+    if (dowFree) return domOk;
+    return domOk || dowOk;
+}
 ```
 
 ### 独立スケジューラスレッド：1 秒ポーリング
 
 スケジューラは独立した daemon スレッドで動作、agent_loop が実行中かどうかに依存しない。個々のジョブエラーはスレッド全体を殺さない：
 
-```python
-def cron_scheduler_loop():
-    while True:
-        time.sleep(1)
-        now = datetime.now()
-        minute_marker = now.strftime("%Y-%m-%d %H:%M")
-        with cron_lock:
-            for job in list(scheduled_jobs.values()):
-                try:
-                    if cron_matches(job.cron, now):
-                        if _last_fired.get(job.id) != minute_marker:
-                            cron_queue.append(job)
-                            _last_fired[job.id] = minute_marker
-                        if not job.recurring:
-                            scheduled_jobs.pop(job.id, None)
-                            if job.durable:
-                                save_durable_jobs()
-                except Exception as e:
-                    print(f"[cron error] {job.id}: {e}")
+```csharp
+void Loop()
+{
+    while (!_cts.IsCancellationRequested)
+    {
+        Thread.Sleep(1000);
+        var now = DateTime.Now;
+        var marker = now.ToString("yyyy-MM-dd HH:mm");
+        foreach (var job in _jobs.Values.ToList())
+        {
+            try
+            {
+                if (!CronMatches(job.Cron, now)) continue;
+                if (_lastFired.TryGetValue(job.Id, out var prev) && prev == marker) continue;
+                _queue.Enqueue(job);
+                _lastFired[job.Id] = marker;
+                if (!job.Recurring)
+                {
+                    _jobs.TryRemove(job.Id, out _);
+                    SaveDurable();
+                }
+            }
+            catch (Exception ex)
+            {
+                OnLog?.Invoke($"[cron error] {job.Id}: {ex.Message}");
+            }
+        }
+    }
+}
 ```
 
 重要な設計：
@@ -140,28 +151,32 @@ def cron_scheduler_loop():
 
 queue processor は時刻をチェックしない。キューに作業があり、Agent がアイドルの時だけ一回の実行を開始する：
 
-```python
-def queue_processor_loop():
-    while True:
-        time.sleep(0.2)
-        if not has_cron_queue():
-            continue
-        if not agent_lock.acquire(blocking=False):
-            continue
-        try:
-            if has_cron_queue():
-                run_agent_turn_locked()
-        finally:
-            agent_lock.release()
+```csharp
+void QueueProcessorLoop()
+{
+    while (true)
+    {
+        Thread.Sleep(200);
+        if (!HasCronQueue()) continue;
+        if (!agentLock.WaitOne(0)) continue;
+        try
+        {
+            if (HasCronQueue()) RunAgentTurnLocked();
+        }
+        finally
+        {
+            agentLock.Release();
+        }
+    }
+}
 ```
 
 agent_loop も時刻をチェックしない。`cron_queue` から発火済みタスクを取り出し、messages に注入するだけ：
 
-```python
-fired = consume_cron_queue()
-for job in fired:
-    messages.append({"role": "user",
-                     "content": f"[Scheduled] {job.prompt}"})
+```csharp
+var fired = cron.DrainQueue();
+foreach (var j in fired)
+    messages.Add(Message.UserText($"<cron-fire id=\"{j.Id}\">{j.Prompt}</cron-fire>"));
 ```
 
 生産者（スケジューラスレッド）、配信者（queue processor）、消費者（agent_loop）は `cron_queue`、`cron_lock`、`agent_lock` で分離されている。
@@ -170,12 +185,13 @@ for job in fired:
 
 `schedule_job` は登録前に cron 式をバリデーションし、不正な場合はエラーを返す：
 
-```python
-def schedule_job(cron, prompt, recurring=True, durable=True):
-    err = validate_cron(cron)
-    if err:
-        return err
-    # ... ジョブ登録
+```csharp
+public string Schedule(string cron, string prompt, bool recurring = true, bool durable = true)
+{
+    var err = ValidateCron(cron);
+    if (err is not null) return $"Error: {err}";
+    // ... register job
+}
 ```
 
 ディスクから durable ジョブを読み込む際も不正な式をスキップし、一つの悪いタスクが起動を妨げない。

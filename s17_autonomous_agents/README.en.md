@@ -38,36 +38,47 @@ Teammate lifecycle expands from two phases to three:
 
 After completing a task, the teammate doesn't exit. It enters the IDLE phase — checking every 5 seconds for new work:
 
-```python
-IDLE_POLL_INTERVAL = 5   # seconds
-IDLE_TIMEOUT = 60         # seconds
+```csharp
+const int IdlePollInterval = 5;   // seconds
+const int IdleTimeout = 60;       // seconds
 
-def idle_poll(agent_name, messages, name, role) -> str:
-    """Return 'work', 'shutdown', or 'timeout'."""
-    for _ in range(IDLE_TIMEOUT // IDLE_POLL_INTERVAL):
-        time.sleep(IDLE_POLL_INTERVAL)
+string IdlePoll(MessageBus bus, TaskStore store, string agentName, List<Message> messages)
+{
+    for (var i = 0; i < IdleTimeout / IdlePollInterval; i++)
+    {
+        Thread.Sleep(TimeSpan.FromSeconds(IdlePollInterval));
 
-        # ① Check inbox (priority)
-        inbox = BUS.read_inbox(agent_name)
-        if inbox:
-            # shutdown_request handled immediately
-            for msg in inbox:
-                if msg.get("type") == "shutdown_request":
-                    # ... reply shutdown_response
-                    return "shutdown"
-            # Regular messages: inject into context, return to WORK
-            messages.append(...)
-            return "work"
+        var inbox = bus.ReadInbox(agentName);
+        if (inbox.Count > 0)
+        {
+            foreach (var msg in inbox)
+            {
+                if (msg.Type == "shutdown_request")
+                {
+                    bus.Send(agentName, "lead", "Shutting down.", "shutdown_response");
+                    return "shutdown";
+                }
+            }
+            messages.Add(Message.UserText("<inbox>\n" + JsonSerializer.Serialize(inbox) + "\n</inbox>"));
+            return "work";
+        }
 
-        # ② Scan task board
-        unclaimed = scan_unclaimed_tasks()
-        if unclaimed:
-            task = unclaimed[0]
-            result = claim_task(task["id"], agent_name)
-            if "Claimed" in result:
-                messages.append(...)
-                return "work"
-    return "timeout"
+        var candidate = store.List().FirstOrDefault(t =>
+            t.Status == "pending"
+            && string.IsNullOrEmpty(t.Owner)
+            && store.CanStart(t));
+        if (candidate is not null)
+        {
+            var (ok, _) = store.Claim(candidate.Id, agentName);
+            if (ok)
+            {
+                messages.Add(Message.UserText($"<claimed>{candidate.Id}</claimed>"));
+                return "work";
+            }
+        }
+    }
+    return "timeout";
+}
 ```
 
 Inbox takes priority (may contain protocol messages like shutdown_request), task board second. A shutdown_request received during IDLE is dispatched immediately — no need to wait for the next WORK phase.
@@ -76,16 +87,16 @@ Inbox takes priority (may contain protocol messages like shutdown_request), task
 
 Find tasks that are pending, unowned, with all dependencies completed (`can_start`):
 
-```python
-def scan_unclaimed_tasks() -> list[dict]:
-    unclaimed = []
-    for f in sorted(TASKS_DIR.glob("task_*.json")):
-        task = json.loads(f.read_text())
-        if (task.get("status") == "pending"
-                and not task.get("owner")
-                and can_start(task["id"])):
-            unclaimed.append(task)
-    return unclaimed
+```csharp
+List<TaskRecord> ScanUnclaimedTasks(TaskStore store)
+{
+    return store.List()
+        .Where(t => t.Status == "pending"
+                 && string.IsNullOrEmpty(t.Owner)
+                 && store.CanStart(t))
+        .OrderBy(t => t.Id)
+        .ToList();
+}
 ```
 
 Three conditions: must be pending, no owner, all blockedBy dependencies completed. `can_start` checks dependency task status — having dependencies doesn't mean the task can't start, only unresolved dependencies block it. Teaching version picks the first by filename; CC uses file locks to prevent multiple teammates from claiming the same task.
@@ -94,19 +105,21 @@ Three conditions: must be pending, no owner, all blockedBy dependencies complete
 
 Auto-claim checks the claim result, not treating failure as success:
 
-```python
-def claim_task(task_id: str, owner: str = "agent") -> str:
-    task = load_task(task_id)
-    if task.status != "pending":
-        return f"Task {task_id} is {task.status}, cannot claim"
-    if task.owner:
-        return f"Task {task_id} already owned by {task.owner}"
-    if not can_start(task_id):
-        return f"Blocked by: {deps}"
-    task.owner = owner
-    task.status = "in_progress"
-    save_task(task)
-    return f"Claimed {task.id} ({task.subject})"
+```csharp
+string ClaimTask(TaskStore store, string taskId, string owner = "agent")
+{
+    var task = store.Load(taskId);
+    if (task.Status != "pending")
+        return $"Task {taskId} is {task.Status}, cannot claim";
+    if (!string.IsNullOrEmpty(task.Owner))
+        return $"Task {taskId} already owned by {task.Owner}";
+    if (!store.CanStart(task))
+        return $"Blocked by: [{string.Join(", ", task.BlockedBy)}]";
+    task.Owner = owner;
+    task.Status = "in_progress";
+    store.Save(task);
+    return $"Claimed {task.Id} ({task.Subject})";
+}
 ```
 
 Teaching version has no file locks, so concurrent claims may still race. But the `task.owner` check avoids the most obvious "last writer wins" problem. CC uses `proper-lockfile` to protect task files, with `claimTask` doing read-modify-write inside a file lock (`utils/tasks.ts:541-612`).
@@ -115,25 +128,24 @@ Teaching version has no file locks, so concurrent claims may still race. But the
 
 s16's teammates exit after finishing. s17 adds the IDLE phase — teammates cycle through WORK → IDLE in an outer loop:
 
-```python
-# Outer loop: WORK → IDLE cycle
-while True:
-    # WORK phase: inner loop (max 10 LLM rounds)
-    for _ in range(10):
-        # Check inbox, dispatch protocol, call LLM, execute tools
-        ...
-        if response.stop_reason != "tool_use":
-            break  # WORK phase ends
+```csharp
+while (true)
+{
+    for (var i = 0; i < 10; i++)
+    {
+        var resp = await client.CreateMessageAsync(system, messages, tools.AllSpecs().ToList());
+        messages.Add(Message.Assistant(resp.Content));
+        if (resp.StopReason != "tool_use") break;
+        var results = await tools.InvokeAllAsync(resp.Content.OfType<ToolUseBlock>());
+        messages.Add(Message.UserToolResults(results));
+    }
 
-    # IDLE phase
-    idle_result = idle_poll(name, messages, name, role)
-    if idle_result == "shutdown":
-        break
-    if idle_result == "timeout":
-        break  # 60s timeout → SHUTDOWN
+    var idleResult = IdlePoll(bus, store, name, messages);
+    if (idleResult == "shutdown") break;
+    if (idleResult == "timeout") break;
+}
 
-# SHUTDOWN: send summary to Lead
-BUS.send(name, "lead", summary, "result")
+bus.Send(name, "lead", summary, "result");
 ```
 
 Key design:
@@ -146,11 +158,12 @@ Key design:
 
 After autoCompact (s08), a teammate's messages list may be compressed into a summary. On each new WORK phase entry, check:
 
-```python
-if len(messages) <= 3:
-    messages.insert(0, {"role": "user",
-        "content": f"<identity>You are '{name}', role: {role}. "
-                   f"Continue your work.</identity>"})
+```csharp
+if (messages.Count <= 3)
+{
+    messages.Insert(0, Message.UserText(
+        $"<identity>You are '{name}', role: {role}. Continue your work.</identity>"));
+}
 ```
 
 Short messages suggest compression happened — re-inject identity. In real CC, context compaction preserves the system prompt; the teaching version's simplified implementation needs manual handling.

@@ -41,22 +41,30 @@ Carries forward S17's teaching-version MessageBus, protocols, and autonomous cla
 
 ### Creation: Task-Worktree Binding
 
-```python
-def create_worktree(name: str, task_id: str = "") -> str:
-    validate_worktree_name(name)       # Only [A-Za-z0-9._-]{1,64}
-    path = WORKTREES_DIR / name
-    ok, result = run_git(["worktree", "add", str(path), "-b", f"wt/{name}", "HEAD"])
-    if not ok:
-        return f"Git error: {result}"
-    if task_id:
-        bind_task_to_worktree(task_id, name)
-    log_event("create", name, task_id)
-    return f"Worktree '{name}' created at {path}"
+```csharp
+string CreateWorktree(string name, string taskId = "")
+{
+    ValidateWorktreeName(name);       // Only [A-Za-z0-9._-]{1,64}
+    var path = Path.Combine(worktreesDir, name);
+    if (worktrees.ContainsKey(name)) return $"Error: worktree '{name}' already exists";
+    Directory.CreateDirectory(path);
+    worktrees[name] = path;
+    if (!string.IsNullOrEmpty(taskId))
+    {
+        BindTaskToWorktree(taskId, name);
+    }
+    LogEvent("create", name, taskId);
+    return $"Worktree '{name}' created at {path}";
+}
 
-def bind_task_to_worktree(task_id: str, worktree_name: str):
-    task = load_task(task_id)
-    task.worktree = worktree_name       # Write worktree field only
-    save_task(task)                     # Status stays pending, waits for teammate claim
+void BindTaskToWorktree(string taskId, string worktreeName)
+{
+    var task = store.Load(taskId);
+    task.Description = string.IsNullOrEmpty(task.Description)
+        ? $"(worktree: {worktreeName})"
+        : $"{task.Description}\n(worktree: {worktreeName})";
+    store.Save(task);
+}
 ```
 
 Binding rule: one task binds to one worktree. Binding does NOT change task status — the task stays `pending`, and advances to `in_progress` only when a teammate claims it. This way Lead can pre-create tasks and worktrees, and teammates naturally claim worktree-bound tasks during idle.
@@ -65,20 +73,23 @@ Binding rule: one task binds to one worktree. Binding does NOT change task statu
 
 Teaching version maintains a `wt_ctx` dict per teammate, tracking the current worktree path. When a teammate claims a task with a worktree, `wt_ctx` is automatically set to the worktree path; the teammate's `bash`, `read_file`, `write_file` execute in the worktree directory:
 
-```python
-# Inside teammate thread
-wt_ctx = {"path": None}
+```csharp
+string? wtPath = null;
 
-def _run_claim_task(task_id):
-    result = claim_task(task_id, owner=name)
-    if "Claimed" in result:
-        task = load_task(task_id)
-        if task.worktree:
-            wt_ctx["path"] = str(WORKTREES_DIR / task.worktree)
-    return result
+string RunClaimTask(string taskId)
+{
+    var (ok, msg) = store.Claim(taskId, name);
+    if (ok)
+    {
+        var task = store.Load(taskId);
+        var match = System.Text.RegularExpressions.Regex.Match(task.Description, @"\(worktree: (\S+)\)");
+        if (match.Success)
+            wtPath = Path.Combine(worktreesDir, match.Groups[1].Value);
+    }
+    return msg;
+}
 
-def _run_bash(command):
-    return run_bash(command, cwd=wt_ctx["path"])  # Execute in worktree
+string RunBash(string command) => BashRunner.Run(command, cwd: wtPath);
 ```
 
 This is a teaching simplification. Real CC's EnterWorktree uses `process.chdir()` to switch the entire process directory, and AgentTool isolation uses `cwdOverride` to wrap sub-agent execution.
@@ -87,22 +98,28 @@ This is a teaching simplification. Real CC's EnterWorktree uses `process.chdir()
 
 After task completion, two choices:
 
-```python
-def remove_worktree(name: str, discard_changes: bool = False) -> str:
-    # Safety check: refuse by default if changes exist
-    if not discard_changes:
-        files, commits = _count_worktree_changes(path)
-        if files > 0 or commits > 0:
-            return "Has uncommitted changes. Use discard_changes=true to force, or keep_worktree"
-    ok, _ = run_git(["worktree", "remove", str(path), "--force"])
-    if not ok:
-        return "Remove failed"
-    run_git(["branch", "-D", f"wt/{name}"])
-    log_event("remove", name)
+```csharp
+string RemoveWorktree(string name, bool discardChanges = false)
+{
+    if (!worktrees.TryGetValue(name, out var path))
+        return $"Error: worktree '{name}' not found";
 
-def keep_worktree(name: str) -> str:
-    log_event("keep", name)
-    return f"Worktree '{name}' kept for review (branch: wt/{name})"
+    if (!discardChanges)
+    {
+        if (Directory.EnumerateFileSystemEntries(path).Any())
+            return "Has uncommitted changes. Use discard_changes=true to force, or keep_worktree";
+    }
+    worktrees.TryRemove(name, out _);
+    if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+    LogEvent("remove", name);
+    return $"Removed worktree '{name}'";
+}
+
+string KeepWorktree(string name)
+{
+    LogEvent("keep", name);
+    return $"Worktree '{name}' kept for review (branch: wt/{name})";
+}
 ```
 
 Keep = preserve branch for manual review and merge. Remove = refuse by default if uncommitted changes; requires `discard_changes=true` to confirm. Does NOT auto-complete task — task completion is triggered explicitly by the teammate's `complete_task`.
@@ -111,21 +128,41 @@ Keep = preserve branch for manual review and merge. Remove = refuse by default i
 
 Each lifecycle operation writes to a log for auditing:
 
-```python
-def log_event(event_type: str, worktree_name: str, task_id: str = ""):
-    event = {"type": event_type, "worktree": worktree_name,
-             "task_id": task_id, "ts": time.time()}
-    # append to .worktrees/events.jsonl
+```csharp
+void LogEvent(string eventType, string worktreeName, string taskId = "")
+{
+    var ev = new
+    {
+        type = eventType,
+        worktree = worktreeName,
+        task_id = taskId,
+        ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0,
+    };
+    File.AppendAllText(
+        Path.Combine(worktreesDir, "events.jsonl"),
+        JsonSerializer.Serialize(ev) + "\n");
+}
 ```
 
 Event types: `create`, `remove`, `keep`. Teaching version logs events for manual auditing; full recovery would need an index or `git worktree list` scanning.
 
 ### run_git: Returns Success/Failure
 
-```python
-def run_git(args: list[str]) -> tuple[bool, str]:
-    r = subprocess.run(["git"] + args, cwd=WORKDIR, ...)
-    return r.returncode == 0, output
+```csharp
+(bool ok, string output) RunGit(params string[] args)
+{
+    var psi = new System.Diagnostics.ProcessStartInfo("git")
+    {
+        RedirectStandardOutput = true,
+        RedirectStandardError = true,
+        WorkingDirectory = workDir,
+    };
+    foreach (var a in args) psi.ArgumentList.Add(a);
+    using var p = System.Diagnostics.Process.Start(psi);
+    var stdout = p!.StandardOutput.ReadToEnd();
+    p.WaitForExit();
+    return (p.ExitCode == 0, stdout);
+}
 ```
 
 `create_worktree` and `remove_worktree` only write event logs after successful git commands, ensuring logs reflect actual state.

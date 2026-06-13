@@ -41,80 +41,118 @@ s02 的循环完全保留。唯一的变动在工具执行前插入 `check_permi
 
 **闸门 1**：一张硬拒绝表，先查，命中就返回阻止信息。（教学示意：简单字符串匹配不是可靠安全机制，命令变体和 shell 展开可能绕过。CC 的做法见附录。）
 
-```python
-DENY_LIST = [
-    "rm -rf /", "sudo", "shutdown", "reboot",
-    "mkfs", "dd if=", "> /dev/sda",
-]
+```csharp
+var denyList = new[] { "rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda" };
 
-def check_deny_list(command: str) -> str | None:
-    for pattern in DENY_LIST:
-        if pattern in command:
-            return f"Blocked: '{pattern}' is on the deny list"
-    return None
+string? CheckDenyList(string command)
+{
+    foreach (var pattern in denyList)
+    {
+        if (command.Contains(pattern, StringComparison.Ordinal))
+            return $"Blocked: '{pattern}' is on the deny list";
+    }
+    return null;
+}
 ```
 
 **闸门 2**：规则匹配——描述"什么时候需要问用户"。每条规则指定工具和检查条件。
 
-```python
-PERMISSION_RULES = [
+```csharp
+var rules = new List<PermissionRule>
+{
+    new()
     {
-        "tools": ["write_file", "edit_file"],
-        "check": lambda args: not (WORKDIR / args.get("path", "")).resolve().is_relative_to(WORKDIR),
-        "message": "Writing outside workspace",
+        Tools = new[] { "write_file", "edit_file" },
+        Check = args =>
+        {
+            if (args.TryGetProperty("path", out var p) && p.ValueKind == JsonValueKind.String)
+            {
+                try { _ = PathGuard.SafePath(workDir, p.GetString() ?? ""); return null; }
+                catch { return "Writing outside workspace"; }
+            }
+            return null;
+        },
+        Message = "Writing outside workspace",
     },
+    new()
     {
-        "tools": ["bash"],
-        "check": lambda args: any(kw in args.get("command", "") for kw in ["rm ", "> /etc/", "chmod 777"]),
-        "message": "Potentially destructive command",
+        Tools = new[] { "bash" },
+        Check = args =>
+        {
+            if (args.TryGetProperty("command", out var c) && c.ValueKind == JsonValueKind.String)
+            {
+                var cmd = c.GetString() ?? "";
+                if (cmd.Contains("rm ", StringComparison.Ordinal) ||
+                    cmd.Contains("> /etc/", StringComparison.Ordinal) ||
+                    cmd.Contains("chmod 777", StringComparison.Ordinal))
+                    return "Potentially destructive command";
+            }
+            return null;
+        },
+        Message = "Potentially destructive command",
     },
-]
+};
 
-def check_rules(tool_name: str, args: dict) -> str | None:
-    for rule in PERMISSION_RULES:
-        if tool_name in rule["tools"] and rule["check"](args):
-            return rule["message"]
-    return None
+string? CheckRules(string toolName, JsonElement args)
+{
+    foreach (var rule in rules)
+    {
+        if (!rule.Tools.Contains(toolName)) continue;
+        var r = rule.Check(args);
+        if (r is not null) return r;
+    }
+    return null;
+}
 ```
 
 **闸门 3**：规则命中后，暂停等用户输入。
 
-```python
-def ask_user(tool_name: str, args: dict, reason: str) -> str:
-    print(f"\n⚠  {reason}")
-    print(f"   Tool: {tool_name}({args})")
-    choice = input("   Allow? [y/N] ").strip().lower()
-    return "allow" if choice in ("y", "yes") else "deny"
+```csharp
+string AskUser(string toolName, JsonElement args, string reason)
+{
+    Console.WriteLine($"\n⚠  {reason}");
+    Console.WriteLine($"   Tool: {toolName}({args})");
+    var choice = (Console.ReadLine() ?? "").Trim().ToLowerInvariant();
+    return choice is "y" or "yes" ? "allow" : "deny";
+}
 ```
 
 **三道闸门串在一起**，插在工具执行之前：
 
-```python
-def check_permission(block) -> bool:
-    # 闸门 1: 硬拒绝
-    if block.name == "bash":
-        reason = check_deny_list(block.input.get("command", ""))
-        if reason:
-            print(f"\n⛔ {reason}")
-            return False
+```csharp
+bool CheckPermission(ToolUseBlock block)
+{
+    if (block.Name == "bash")
+    {
+        var cmd = block.Input.TryGetProperty("command", out var c) ? c.GetString() ?? "" : "";
+        var reason = CheckDenyList(cmd);
+        if (reason is not null)
+        {
+            Console.WriteLine($"\n⛔ {reason}");
+            return false;
+        }
+    }
 
-    # 闸门 2 + 3: 规则匹配 → 用户审批
-    reason = check_rules(block.name, block.input)
-    if reason:
-        decision = ask_user(block.name, block.input, reason)
-        if decision == "deny":
-            return False
+    var ruleReason = CheckRules(block.Name, block.Input);
+    if (ruleReason is not null)
+    {
+        if (AskUser(block.Name, block.Input, ruleReason) == "deny") return false;
+    }
 
-    return True
+    return true;
+}
 
-# 在 agent_loop 中——s02 的循环只加了一行：
-for block in response.content:
-    if block.type == "tool_use":
-        if not check_permission(block):           # ← 新增
-            results.append({... "content": "Permission denied."})
-            continue
-        output = TOOL_HANDLERS[block.name](**block.input)  # s02 原有
-        results.append(...)
+// In the agent loop — s02 with one line added:
+foreach (var block in response.Content.OfType<ToolUseBlock>())
+{
+    if (!CheckPermission(block))      // ← NEW
+    {
+        results.Add(new ToolResultBlock(block.Id, "Permission denied."));
+        continue;
+    }
+    var output = tools.Invoke(block.Name, block.Input);
+    results.Add(new ToolResultBlock(block.Id, output));
+}
 ```
 
 ---

@@ -34,62 +34,28 @@ The dispatch mechanism is unchanged; the new tool is still routed through `TOOL_
 
 **The todo_write tool** accepts a list with statuses, keeps it in the current process memory, and displays progress in the terminal:
 
-```python
-CURRENT_TODOS: list[dict] = []
+```csharp
+var state = new TodoTools.TodoState();
 
-def run_todo_write(todos: list) -> str:
-    global CURRENT_TODOS
-    CURRENT_TODOS = todos
-
-    lines = ["\n## Current Tasks"]
-    for t in CURRENT_TODOS:
-        icon = {"pending": " ", "in_progress": "▸", "completed": "✓"}[t["status"]]
-        lines.append(f"  [{icon}] {t['content']}")
-    print("\n".join(lines))
-    return f"Updated {len(CURRENT_TODOS)} tasks"
+TodoTools.Register(tools, state);
 ```
 
 The tool definition joins the other 5 in the dispatch map:
 
-```python
-TOOLS = [
-    {"name": "bash",       ...},
-    {"name": "read_file",  ...},
-    {"name": "write_file", ...},
-    {"name": "edit_file",  ...},
-    {"name": "glob",       ...},
-    # s05: new entry
-    {"name": "todo_write", "description": "Create and manage a task list ...",
-     "input_schema": {
-         "type": "object",
-         "properties": {
-             "todos": {
-                 "type": "array",
-                 "items": {
-                     "type": "object",
-                     "properties": {
-                         "content": {"type": "string"},
-                         "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
-                     },
-                 },
-             },
-         },
-     },
-    },
-]
-
-TOOL_HANDLERS["todo_write"] = run_todo_write
+```csharp
+BashTool.Register(tools, workDir);
+FileTools.Register(tools, workDir);
+TodoTools.Register(tools, state);   // s05: new tool
 ```
 
 **Nag reminder**, when the model hasn't called `todo_write` for 3 consecutive rounds, a reminder is automatically injected (teaching mechanism; CC source has no fixed round-count logic):
 
-```python
-if rounds_since_todo >= 3 and messages:
-    messages.append({
-        "role": "user",
-        "content": "<reminder>Update your todos.</reminder>",
-    })
-    rounds_since_todo = 0
+```csharp
+if (++roundsSinceTodo >= 3 && messages.Count > 0)
+{
+    messages.Add(Message.UserText("<reminder>Update your todos.</reminder>"));
+    roundsSinceTodo = 0;
+}
 ```
 
 Typical flow when the Agent receives a task: first call `todo_write` to list all steps (all `pending`) → pick one step, set it to `in_progress` → complete it, set to `completed` → look at the next `pending` → continue. After 3 rounds without `todo_write`, the loop appends a reminder before the next LLM call.

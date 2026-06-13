@@ -13,13 +13,12 @@ s01 → s02 → s03 → s04 → s05 → s06 → `s07` → [s08](../s08_context_c
 
 プロジェクトには React コンポーネント仕様、SQL スタイルガイド、API 設計ドキュメントがある。Agent にこれらの仕様を自動的に守らせたい。最も直接的な方法 — すべて system prompt に詰め込む：
 
-```python
-SYSTEM = (
-    f"You are a coding agent. "
-    + open("docs/react-style.md").read()       # 2000 行
-    + open("docs/sql-style.md").read()         # 1500 行
-    + open("docs/api-design.md").read()        # 3000 行
-)
+```csharp
+var SYSTEM =
+    $"You are a coding agent. "
+    + File.ReadAllText("docs/react-style.md")       // 2000 lines
+    + File.ReadAllText("docs/sql-style.md")         // 1500 lines
+    + File.ReadAllText("docs/api-design.md");       // 3000 lines
 ```
 
 6500 行の system prompt。Agent は LLM を呼び出すたびにこれらのドキュメントを運ぶ — CSS の色を変えるときも SQL クエリを修正するときも。99% の内容が現在のタスクと無関係で、トークンを無駄に消費する。
@@ -57,47 +56,61 @@ skills/
 
 **第 1 層：起動時にカタログを注入**：harness は起動時に `_scan_skills()` を呼び出して skills/ ディレクトリをスキャンし、各 SKILL.md の YAML frontmatter（`name`、`description`）を解析して `SKILL_REGISTRY` 辞書に格納する。`list_skills()` はレジストリからカタログを生成し、SYSTEM prompt に注入する。Agent は毎ターン「どのスキルが利用可能か」を確認できる。追加の API 呼び出しは不要：
 
-```python
-SKILL_REGISTRY: dict[str, dict] = {}
+```csharp
+public sealed class SkillRegistry
+{
+    private readonly Dictionary<string, SkillManifest> _byName = new();
 
-def _scan_skills():
-    if not SKILLS_DIR.exists():
-        return
-    for d in sorted(SKILLS_DIR.iterdir()):
-        if not d.is_dir():
-            continue
-        manifest = d / "SKILL.md"
-        if manifest.exists():
-            raw = manifest.read_text()
-            meta, body = _parse_frontmatter(raw)
-            name = meta.get("name", d.name)
-            desc = meta.get("description", raw.split("\n")[0].lstrip("#").strip())
-            SKILL_REGISTRY[name] = {"name": name, "description": desc, "content": raw}
+    public static SkillRegistry LoadFromDir(string skillsDir)
+    {
+        var reg = new SkillRegistry();
+        if (!Directory.Exists(skillsDir)) return reg;
 
-_scan_skills()  # runs once at startup
+        foreach (var dir in Directory.EnumerateDirectories(skillsDir))
+        {
+            var manifest = Path.Combine(dir, "SKILL.md");
+            if (!File.Exists(manifest)) continue;
 
-def list_skills() -> str:
-    return "\n".join(f"- **{s['name']}**: {s['description']}" for s in SKILL_REGISTRY.values())
+            var raw = File.ReadAllText(manifest);
+            var (name, desc) = ParseFrontmatter(raw);
+            if (string.IsNullOrEmpty(name)) name = Path.GetFileName(dir);
+            reg._byName[name] = new SkillManifest
+            {
+                Name = name,
+                Description = desc,
+                FullContent = raw,
+            };
+        }
+        return reg;
+    }
 
-def build_system() -> str:
-    catalog = list_skills()
-    return (
-        f"You are a coding agent at {WORKDIR}. "
-        f"Skills available:\n{catalog}\n"
-        "Use load_skill to get full details when needed."
-    )
+    public string Catalog() =>
+        string.Join("\n", _byName.Values.Select(s => $"- **{s.Name}**: {s.Description}"));
+}
 
-SYSTEM = build_system()
+public sealed record SkillManifest
+{
+    public string Name { get; init; } = "";
+    public string Description { get; init; } = "";
+    public string FullContent { get; init; } = "";
+}
+
+var skills = SkillRegistry.LoadFromDir(skillsDir);  // runs once at startup
+
+var SYSTEM =
+    $"You are a coding agent at {workDir}. " +
+    "Skills available:\n" + skills.Catalog() + "\n" +
+    "Use load_skill to get full details when needed.";
 ```
 
 **第 2 層：load_skill**：Agent が「SQL スタイルガイドが必要」と判断し、`load_skill("sql-style")` を呼び出す。レジストリを通じて検索し、ファイルパスを経由しないため、パストラバーサルのリスクがない。SKILL.md の内容は `tool_result` を通じて注入され、既存の file および bash ツールを通じて、参照される `references/`、`scripts/`、`assets/` へのその後のアクセスも含められる。
 
-```python
-def load_skill(name: str) -> str:
-    skill = SKILL_REGISTRY.get(name)
-    if not skill:
-        return f"Skill not found: {name}"
-    return skill["content"]
+```csharp
+public static string LoadSkill(string name, SkillRegistry registry)
+{
+    var skill = registry.Get(name);
+    return skill is null ? $"Skill not found: {name}" : skill.FullContent;
+}
 ```
 
 重要な違い：スキル内容は system prompt の一部ではなく、ツール結果として現在の messages に入る。後続の呼び出しでは履歴とともに携帯され、コンテキスト圧縮、切り捨て、またはセッション終了まで保持される。これは s08 の compact と自然に接続する：オンデマンド読み込みで「運ぶべきでないものは運ばない」を解決し、compact が「捨てるべきものをどう捨てるか」を解決する。

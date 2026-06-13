@@ -43,71 +43,94 @@ The tutorial uses mock handlers to simulate external servers. The real version w
 
 ### MCPClient: Discovery + Invocation
 
-```python
-class MCPClient:
-    def __init__(self, name: str):
-        self.name = name
-        self.tools: list[dict] = []
-        self._handlers: dict[str, callable] = {}
+```csharp
+sealed class MCPClient
+{
+    public string Name { get; }
+    public IReadOnlyList<string> Tools => _tools;
+    private readonly List<string> _tools = new();
+    private readonly Dictionary<string, Func<JsonElement, string>> _handlers = new();
 
-    def register(self, tool_defs, handlers):
-        """Simulates tools/list discovery."""
-        self.tools = tool_defs
-        self._handlers = handlers
+    public MCPClient(string name) { Name = name; }
 
-    def call_tool(self, tool_name: str, args: dict) -> str:
-        """Simulates tools/call."""
-        handler = self._handlers.get(tool_name)
-        if not handler:
-            return f"MCP error: unknown tool '{tool_name}'"
-        return handler(**args)
+    public void Register(IEnumerable<string> toolDefs, Dictionary<string, Func<JsonElement, string>> handlers)
+    {
+        _tools.Clear();
+        _tools.AddRange(toolDefs);
+        _handlers.Clear();
+        foreach (var (k, v) in handlers) _handlers[k] = v;
+    }
+
+    public string CallTool(string toolName, JsonElement args)
+    {
+        if (!_handlers.TryGetValue(toolName, out var handler))
+            return $"MCP error: unknown tool '{toolName}'";
+        return handler(args);
+    }
+}
 ```
 
 The tutorial uses Python functions to simulate server tool implementations. The real version communicates with subprocesses via stdio JSON-RPC.
 
 ### connect_mcp: Connect + Discover
 
-```python
-def connect_mcp(name: str) -> str:
-    if name in mcp_clients:
-        return f"MCP server '{name}' already connected"
-    factory = MOCK_SERVERS.get(name)
-    if not factory:
-        return f"Unknown server '{name}'. Available: ..."
-    mcp_client = factory()
-    mcp_clients[name] = mcp_client
-    return f"Connected to '{name}'. Discovered: ..."
+```csharp
+var mcpClients = new Dictionary<string, MCPClient>();
+var mockServers = new Dictionary<string, Func<MCPClient>>
+{
+    ["docs"] = () => new MCPClient("docs"),
+    ["deploy"] = () => new MCPClient("deploy"),
+};
+
+string ConnectMcp(string name)
+{
+    if (mcpClients.ContainsKey(name))
+        return $"MCP server '{name}' already connected";
+    if (!mockServers.TryGetValue(name, out var factory))
+        return $"Unknown server '{name}'. Available: {string.Join(", ", mockServers.Keys)}";
+    var client = factory();
+    mcpClients[name] = client;
+    return $"Connected to '{name}'. Discovered: {string.Join(", ", client.Tools)}";
+}
 ```
 
 After connecting, the server's tools are immediately available.
 
 ### normalize_mcp_name: Name Normalization
 
-```python
-_DISALLOWED_CHARS = re.compile(r'[^a-zA-Z0-9_-]')
+```csharp
+static readonly Regex DisallowedChars = new(@"[^a-zA-Z0-9_-]", RegexOptions.Compiled);
 
-def normalize_mcp_name(name: str) -> str:
-    return _DISALLOWED_CHARS.sub('_', name)
+string NormalizeMcpName(string name) => DisallowedChars.Replace(name, "_");
 ```
 
 All non-`[a-zA-Z0-9_-]` characters are replaced with `_`. Prevents special characters in server or tool names from causing naming conflicts or injection issues.
 
 ### assemble_tool_pool: Assemble Tool Pool
 
-```python
-def assemble_tool_pool() -> tuple[list[dict], dict]:
-    tools = list(BUILTIN_TOOLS)
-    handlers = dict(BUILTIN_HANDLERS)
-    for server_name, mcp_client in mcp_clients.items():
-        safe_server = normalize_mcp_name(server_name)
-        for tool_def in mcp_client.tools:
-            safe_tool = normalize_mcp_name(tool_def["name"])
-            prefixed = f"mcp__{safe_server}__{safe_tool}"
-            tools.append(...)
-            handlers[prefixed] = (
-                lambda *, c=mcp_client, t=tool_def["name"], **kw:
-                    c.call_tool(t, kw))
-    return tools, handlers
+```csharp
+(ToolRegistry pool, Dictionary<string, Func<JsonElement, string>> handlers) AssembleToolPool()
+{
+    var pool = new ToolRegistry();
+    var handlers = new Dictionary<string, Func<JsonElement, string>>();
+    foreach (var t in builtin.All()) pool.Register(t.Name, t.Description, t.InputSchema, t.Handler);
+    foreach (var (serverName, client) in mcpClients)
+    {
+        var safeServer = NormalizeMcpName(serverName);
+        foreach (var toolName in client.Tools)
+        {
+            var safeTool = NormalizeMcpName(toolName);
+            var prefixed = $"mcp__{safeServer}__{safeTool}";
+            var captured = client;
+            var capturedTool = toolName;
+            var schema = SchemaBuilder.Object($"MCP tool {toolName} on {serverName}.",
+                new Dictionary<string, (string, string, bool)>());
+            pool.Register(prefixed, $"MCP tool {toolName} on {serverName}. (readOnly)", schema,
+                input => captured.CallTool(capturedTool, input));
+        }
+    }
+    return (pool, handlers);
+}
 ```
 
 The prefix `mcp__{server}__{tool}` prevents tool name collisions across different servers. Names are normalized through `normalize_mcp_name`.
@@ -118,14 +141,19 @@ MCP tool descriptions include `(readOnly)` or `(destructive)` annotations — th
 
 s10-s18's agent_loop used prompt caching to avoid re-serialization. s19 removes the cache:
 
-```python
-def agent_loop(messages, context):
-    tools, handlers = assemble_tool_pool()     # Rebuild every time
-    system = assemble_system_prompt(context)    # Regenerate every time
-    ...
-    if any(b.name == "connect_mcp" ...):
-        tools, handlers = assemble_tool_pool()  # Rebuild after connection
-        system = assemble_system_prompt(context)
+```csharp
+async Task AgentLoop(List<Message> messages, Dictionary<string, object> context)
+{
+    var (tools, handlers) = AssembleToolPool();
+    var system = AssembleSystemPrompt(context);
+    var resp = await client.CreateMessageAsync(system, messages, tools.AllSpecs().ToList());
+    messages.Add(Message.Assistant(resp.Content));
+    if (resp.Content.OfType<ToolUseBlock>().Any(b => b.Name == "connect_mcp"))
+    {
+        (tools, handlers) = AssembleToolPool();
+        system = AssembleSystemPrompt(context);
+    }
+}
 ```
 
 Reason: after `connect_mcp`, the tool pool changes — new tools like `mcp__docs__search` are added. The cached tool list is stale; continuing to use it means the model can't call the new tools. The tutorial simply removes caching, at the cost of slightly more serialization time.

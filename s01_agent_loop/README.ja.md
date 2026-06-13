@@ -40,71 +40,69 @@
 
 **ステップ 1**：ユーザーの質問を最初のメッセージとして設定する。
 
-```python
-messages = [{"role": "user", "content": query}]
+```csharp
+var messages = new List<Message> { Message.UserText(query) };
 ```
 
 **ステップ 2**：メッセージとツール定義を一緒に LLM に送信する。
 
-```python
-response = client.messages.create(
-    model=MODEL, system=SYSTEM, messages=messages,
-    tools=TOOLS, max_tokens=8000,
-)
+```csharp
+var response = await client.CreateMessageAsync(
+    systemPrompt: SYSTEM, messages: messages, tools: toolSpecs, maxTokensOverride: 8000);
 ```
 
 **ステップ 3**：モデルの応答を追加し、ツールを呼び出したか確認する。呼び出しなし → 終了。
 
-```python
-messages.append({"role": "assistant", "content": response.content})
-if response.stop_reason != "tool_use":
-    return
+```csharp
+messages.Add(Message.Assistant(response.Content));
+if (response.StopReason != "tool_use") return;
 ```
 
 **ステップ 4**：モデルが要求したツールを実行し、結果を収集する。
 
-```python
-results = []
-for block in response.content:
-    if block.type == "tool_use":
-        output = run_bash(block.input["command"])
-        results.append({
-            "type": "tool_result",
-            "tool_use_id": block.id,
-            "content": output,
-        })
+```csharp
+var results = new List<ToolResultBlock>();
+foreach (var block in response.Content.OfType<ToolUseBlock>())
+{
+    var cmd = block.Input.GetProperty("command").GetString()!;
+    var r = BashRunner.Run(cmd, workDir);
+    var output = (r.StdOut + r.StdErr).Trim();
+    if (output.Length == 0) output = "(no output)";
+    results.Add(new ToolResultBlock(block.Id, output));
+}
 ```
 
 **ステップ 5**：ツールの結果を新しいメッセージとして追加し、ステップ 2 に戻る。
 
-```python
-messages.append({"role": "user", "content": results})
+```csharp
+messages.Add(Message.UserToolResults(results));
 ```
 
 完全な関数に組み立てる：
 
-```python
-def agent_loop(messages):
-    while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
-        )
-        messages.append({"role": "assistant", "content": response.content})
+```csharp
+async Task AgentLoop(List<Message> messages)
+{
+    while (true)
+    {
+        var response = await client.CreateMessageAsync(
+            systemPrompt: SYSTEM, messages: messages, tools: toolSpecs, maxTokensOverride: 8000);
+        messages.Add(Message.Assistant(response.Content));
 
-        if response.stop_reason != "tool_use":
-            return
+        if (response.StopReason != "tool_use") return;
 
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                output = run_bash(block.input["command"])
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": output,
-                })
-        messages.append({"role": "user", "content": results})
+        var results = new List<ToolResultBlock>();
+        foreach (var block in response.Content.OfType<ToolUseBlock>())
+        {
+            var cmd = block.Input.GetProperty("command").GetString()!;
+            var r = BashRunner.Run(cmd, workDir);
+            var output = (r.StdOut + r.StdErr).Trim();
+            if (output.Length == 0) output = "(no output)";
+            results.Add(new ToolResultBlock(block.Id, output));
+        }
+        messages.Add(Message.UserToolResults(results));
+    }
+}
 ```
 
 30 行未満 — これが最小実行可能な agent harness のカーネルだ。これは知能そのものではなく、モデルが継続的に行動できるための最小ランタイムフレームワーク。モデルが決定し（ツールを呼ぶか、どれを呼ぶか）、harness が実行する（呼ばれたら実行し、結果を戻す）。次の 18 章はすべてこのループの上に仕組みを積み重ねていく。ループ自体は永遠に変わらない。

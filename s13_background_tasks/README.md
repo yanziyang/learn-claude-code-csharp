@@ -43,23 +43,26 @@ Agent 的 bash 工具也一样。在大型 solution 上跑 `dotnet build` 要好
 
 模型通过 bash 工具的 `run_in_background` 参数显式请求后台执行。如果模型没指定，教学版用关键词启发式兜底：
 
-```python
-def is_slow_operation(tool_name: str, tool_input: dict) -> bool:
-    """Fallback heuristic: commands likely to take > 30s."""
-    if tool_name != "bash":
-        return False
-    cmd = tool_input.get("command", "").lower()
-    slow_keywords = ["install", "build", "test", "deploy", "compile",
-                     "docker build", "dotnet build", "dotnet test",
-                     "dotnet restore", "npm install",
-                     "cargo build", "pytest", "make"]
-    return any(kw in cmd for kw in slow_keywords)
+```csharp
+static bool IsSlowOperation(string toolName, JsonElement toolInput)
+{
+    if (toolName != "bash") return false;
+    var cmd = (toolInput.TryGetProperty("command", out var c) ? c.GetString() : "")
+              ?.ToLowerInvariant() ?? "";
+    string[] slowKeywords = ["install", "build", "test", "deploy", "compile",
+                             "docker build", "dotnet build", "dotnet test",
+                             "dotnet restore", "npm install",
+                             "cargo build", "pytest", "make"];
+    return slowKeywords.Any(kw => cmd.Contains(kw));
+}
 
-def should_run_background(tool_name: str, tool_input: dict) -> bool:
-    """Model explicit request takes priority; fallback to heuristic."""
-    if tool_input.get("run_in_background"):
-        return True
-    return is_slow_operation(tool_name, tool_input)
+static bool ShouldRunBackground(string toolName, JsonElement toolInput)
+{
+    if (toolInput.TryGetProperty("run_in_background", out var rb)
+        && rb.ValueKind == JsonValueKind.True)
+        return true;
+    return IsSlowOperation(toolName, toolInput);
+}
 ```
 
 CC 的 bash 工具 schema 里有 `run_in_background: boolean` 参数（`BashTool.tsx:241`）。模型自己决定哪些命令丢后台，不靠关键词猜。教学版保留启发式作为兜底，但主路径是模型显式请求。
@@ -68,33 +71,26 @@ CC 的 bash 工具 schema 里有 `run_in_background: boolean` 参数（`BashTool
 
 把工具调用包装成 worker 函数，扔到 daemon 线程里执行。每个后台任务有唯一 ID，状态存在 `background_tasks` 字典里：
 
-```python
-_bg_counter = 0
-background_tasks: dict[str, dict] = {}   # bg_id → {tool_use_id, command, status}
-background_results: dict[str, str] = {}   # bg_id → output
-background_lock = threading.Lock()
+```csharp
+int _bgCounter = 0;
+ConcurrentDictionary<string, BackgroundTask> _tasks = new(); // bg_id → {tool_use_id, command, task}
+ConcurrentDictionary<string, string> _results = new();       // bg_id → output
+object _lock = new();
 
-def start_background_task(block) -> str:
-    """Run tool in a daemon thread. Returns background task ID."""
-    global _bg_counter
-    _bg_counter += 1
-    bg_id = f"bg_{_bg_counter:04d}"
+string StartBackgroundTask(ToolUseBlock block)
+{
+    var bgId = $"bg_{Interlocked.Increment(ref _bgCounter):D4}";
 
-    def worker():
-        result = execute_tool(block)
-        with background_lock:
-            background_tasks[bg_id]["status"] = "completed"
-            background_results[bg_id] = result
-
-    with background_lock:
-        background_tasks[bg_id] = {
-            "tool_use_id": block.id,
-            "command": block.input.get("command", ""),
-            "status": "running",
-        }
-    thread = threading.Thread(target=worker, daemon=True)
-    thread.start()
-    return bg_id
+    Task<string> task;
+    lock (_lock)
+    {
+        task = Task.Run(() => ExecuteTool(block));
+        _tasks[bgId] = new BackgroundTask(bgId, block.Id,
+            block.Input.TryGetProperty("command", out var c) ? c.GetString() ?? "" : "",
+            task);
+    }
+    return bgId;
+}
 ```
 
 返回 `bg_id` 而不是只返回 `[Running in background...]`。`daemon=True` 确保 Agent 进程退出时线程跟着退出。教学版用内存字典追踪状态；真实 CC 有 `LocalShellTaskState`，输出重定向到文件，支持停止任务、读取后续输出等完整生命周期。
@@ -103,25 +99,28 @@ def start_background_task(block) -> str:
 
 后台任务完成后，收集结果并格式化为 `<task_notification>` 通知：
 
-```python
-def collect_background_results() -> list[str]:
-    """Collect completed results as task_notification messages."""
-    with background_lock:
-        ready_ids = [bid for bid, task in background_tasks.items()
-                     if task["status"] == "completed"]
-    notifications = []
-    for bg_id in ready_ids:
-        with background_lock:
-            task = background_tasks.pop(bg_id)
-            output = background_results.pop(bg_id, "")
-        notifications.append(
-            f"<task_notification>\n"
-            f"  <task_id>{bg_id}</task_id>\n"
-            f"  <status>completed</status>\n"
-            f"  <command>{task['command']}</command>\n"
-            f"  <summary>{output[:200]}</summary>\n"
-            f"</task_notification>")
-    return notifications
+```csharp
+List<string> CollectBackgroundResults()
+{
+    var notifications = new List<string>();
+    foreach (var (bgId, bt) in _tasks)
+    {
+        if (!bt.Running.IsCompleted) continue;
+        if (!_tasks.TryRemove(bgId, out var task)) continue;
+        string output;
+        try { output = task.Running.Result; }
+        catch (Exception ex) { output = $"Error: {ex.GetType().Name}: {ex.Message}"; }
+        var summary = output.Length > 200 ? output[..200] : output;
+        notifications.Add(
+            $"<task_notification>\n" +
+            $"  <task_id>{bgId}</task_id>\n" +
+            $"  <status>completed</status>\n" +
+            $"  <command>{task.Command}</command>\n" +
+            $"  <summary>{summary}</summary>\n" +
+            $"</task_notification>");
+    }
+    return notifications;
+}
 ```
 
 通知不复用原始 `tool_use_id`。原始 tool call 已经用占位 `tool_result` 回复了，后台完成是独立事件，用 `task_notification` 格式注入。这符合 Messages API 的工具配对语义：一个 `tool_use` 只对应一个 `tool_result`。
@@ -130,30 +129,31 @@ def collect_background_results() -> list[str]:
 
 agent_loop 里，工具执行分两条路，通知和结果合并为一条 user 消息：
 
-```python
-results = []
-for block in response.content:
-    if block.type != "tool_use":
-        continue
-    if should_run_background(block.name, block.input):
-        bg_id = start_background_task(block)
-        results.append({"type": "tool_result",
-            "tool_use_id": block.id,
-            "content": f"[Background task {bg_id} started] "
-                       f"Result will be available when complete."})
-    else:
-        output = execute_tool(block)
-        results.append({"type": "tool_result",
-            "tool_use_id": block.id, "content": output})
+```csharp
+var results = new List<ContentBlock>();
+foreach (var block in response.Content.OfType<ToolUseBlock>())
+{
+    if (ShouldRunBackground(block.Name, block.Input))
+    {
+        var bgId = StartBackgroundTask(block);
+        results.Add(new ToolResultBlock(block.Id,
+            $"[Background task {bgId} started] " +
+            "Result will be available when complete."));
+    }
+    else
+    {
+        var output = ExecuteTool(block);
+        results.Add(new ToolResultBlock(block.Id, output));
+    }
+}
 
-# 通知和工具结果合入同一条 user 消息
-user_content = []
-bg_notifications = collect_background_results()
-if bg_notifications:
-    for notif in bg_notifications:
-        user_content.append({"type": "text", "text": notif})
-user_content.extend(results)
-messages.append({"role": "user", "content": user_content})
+// Merge notifications and tool results into one user message
+var userContent = new List<ContentBlock>();
+var bgNotifications = CollectBackgroundResults();
+foreach (var notif in bgNotifications)
+    userContent.Add(new TextBlock(notif));
+userContent.AddRange(results);
+messages.Add(new Message { Role = "user", Content = userContent });
 ```
 
 慢操作先回一个带 `bg_id` 的占位 tool_result，LLM 知道这个命令还在跑，可以先做别的事。后台完成后，通知作为独立 text block 和当前轮的 tool_result 一起组成 user 消息。

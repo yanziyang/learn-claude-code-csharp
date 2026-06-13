@@ -64,14 +64,17 @@ User prefers using tabs, not spaces, for indentation.
 
 写入新记忆时自动重建索引：
 
-```python
-def write_memory_file(name, mem_type, description, body):
-    slug = name.lower().replace(" ", "-")
-    filepath = MEMORY_DIR / f"{slug}.md"
-    filepath.write_text(
-        f"---\nname: {name}\ndescription: {description}\ntype: {mem_type}\n---\n\n{body}\n"
-    )
-    _rebuild_index()
+```csharp
+public void Write(MemoryFile mem)
+{
+    var slug = Slugify(mem.Name);
+    var filename = string.IsNullOrEmpty(slug) ? Guid.NewGuid().ToString("n") : slug + ".md";
+    mem.Filename = filename;
+    var path = Path.Combine(_memoryDir, filename);
+    var content = $"---\nname: {mem.Name}\ndescription: {mem.Description}\ntype: {mem.Type}\n---\n\n{mem.Body}\n";
+    File.WriteAllText(path, content);
+    RebuildIndex();
+}
 ```
 
 ### 加载：两条路径
@@ -80,22 +83,52 @@ def write_memory_file(name, mem_type, description, body):
 
 **路径二：相关记忆按需注入。** 每次用户请求开始时，`load_memories()` 把最近对话和记忆目录（name + description）一起发给 LLM 做一次轻量 side-query，选出相关的文件名，再读文件内容临时注入到当前 user turn。最多 5 条，控制开销。
 
-```python
-def select_relevant_memories(messages, max_items=5):
-    files = list_memory_files()
-    if not files:
-        return []
+```csharp
+public async Task<List<string>> SelectRelevantAsync(IReadOnlyList<Message> messages, int maxItems = 5, CancellationToken ct = default)
+{
+    var files = _store.List();
+    if (files.Count == 0) return new List<string>();
 
-    # Build catalog: "0: user-preference-tabs — User prefers tabs..."
-    catalog = "\n".join(f"{i}: {f['name']} — {f['description']}" for i, f in enumerate(files))
+    var recentText = CollectRecentText(messages);
+    if (string.IsNullOrWhiteSpace(recentText)) return new List<string>();
 
-    response = client.messages.create(model=MODEL, messages=[{"role": "user",
-        "content": f"Select relevant memory indices. Return JSON array.\n\n"
-                   f"Recent conversation:\n{recent}\n\nMemory catalog:\n{catalog}"}],
-        max_tokens=200)
-    text = extract_text(response.content).strip()
-    indices = json.loads(re.search(r'\[.*?\]', text).group())
-    return [files[i]["filename"] for i in indices if 0 <= i < len(files)]
+    // Build catalog: "0: user-preference-tabs — User prefers tabs..."
+    var catalog = string.Join("\n", files.Select((f, i) => $"{i}: {f.Name} — {f.Description}"));
+    var prompt =
+        "Given the recent conversation and the memory catalog below, " +
+        "select the indices of memories that are clearly relevant. " +
+        "Return ONLY a JSON array of integers, e.g. [0, 3]. " +
+        "If none are relevant, return [].\n\n" +
+        $"Recent conversation:\n{recentText}\n\n" +
+        $"Memory catalog:\n{catalog}";
+
+    try
+    {
+        var resp = await _client.CreateMessageAsync(
+            systemPrompt: "You are a memory router.",
+            messages: new List<Message> { Message.UserText(prompt) },
+            tools: null,
+            maxTokensOverride: 200,
+            ct: ct);
+        var text = string.Join("\n", resp.Content.OfType<TextBlock>().Select(t => t.Text)).Trim();
+        var match = Regex.Match(text, @"\[.*?\]", RegexOptions.Singleline);
+        if (match.Success)
+        {
+            var indices = JsonSerializer.Deserialize<List<int>>(match.Value) ?? new();
+            return indices
+                .Where(i => i >= 0 && i < files.Count)
+                .Take(maxItems)
+                .Select(i => files[i].Filename)
+                .ToList();
+        }
+    }
+    catch
+    {
+        // Fall through to keyword fallback
+    }
+
+    return KeywordFallback(recentText, files, maxItems);
+}
 ```
 
 如果 side-query 失败（API 错误、JSON 解析失败），降级到关键词匹配 name + description。
@@ -106,43 +139,64 @@ def select_relevant_memories(messages, max_items=5):
 
 `extract_memories()` 在每轮结束时运行，条件是模型停止且没有 tool_use（说明对话告一段落）：
 
-```python
-# In agent_loop:
-if response.stop_reason != "tool_use":
-    extract_memories(pre_compress)   # 从压缩前快照提取新记忆
-    consolidate_memories()       # 检查是否需要整理
-    return
+```csharp
+agent.Hooks.OnStop((IReadOnlyList<Message>? history) =>
+{
+    if (history is null || history.Count == 0) return null;
+    _ = Task.Run(async () =>
+    {
+        // In agent_loop: stop_reason != "tool_use" branch
+        var extracted = await extractor.ExtractFromAsync(history);  // Extract new memories
+        if (extracted > 0 || store.List().Count >= 10)
+        {
+            await consolidator.ConsolidateIfNeededAsync();  // Check if consolidation is needed
+        }
+    });
+    return null;
+});
 ```
 
 提取前先检查已有记忆，避免重复。提取 prompt 要求 LLM 返回 `{name, type, description, body}` 的 JSON 数组，只有确实有新信息时才写文件。
 
-```python
-def extract_memories(messages):
-    dialogue = format_recent_messages(messages[-10:])
-    existing = "\n".join(f"- {m['name']}: {m['description']}" for m in list_memory_files())
+```csharp
+public async Task<int> ExtractFromAsync(IReadOnlyList<Message> messages, CancellationToken ct = default)
+{
+    var dialogue = new StringBuilder();
+    foreach (var m in messages.TakeLast(10))
+    {
+        var t = string.Join(" ", m.Content.OfType<TextBlock>().Select(b => b.Text));
+        if (!string.IsNullOrWhiteSpace(t))
+        {
+            dialogue.AppendLine($"{m.Role}: {t}");
+        }
+    }
+    if (dialogue.Length == 0) return 0;
 
-    prompt = (
-        "Extract user preferences, constraints, or project facts.\n"
-        "Return JSON array: [{name, type, description, body}].\n"
-        "If nothing new or already covered, return [].\n\n"
-        f"Existing memories:\n{existing}\n\nDialogue:\n{dialogue[:4000]}"
-    )
-    # ... parse response, write files ...
+    var existingDesc = string.Join("\n", _store.List().Select(m => $"- {m.Name}: {m.Description}"));
+
+    var prompt =
+        "Extract user preferences, constraints, or project facts.\n" +
+        "Return JSON array: [{name, type, description, body}].\n" +
+        "If nothing new or already covered, return [].\n\n" +
+        $"Existing memories:\n{existingDesc}\n\nDialogue:\n{dialogue.ToString()[..Math.Min(4000, dialogue.Length)]}";
+    // ... parse response, write files ...
+}
 ```
 
 ### 整理：低频合并去重
 
 记忆文件会积累。`consolidate_memories()` 在文件数达到阈值（默认 10）时触发，让 LLM 去重、合并矛盾、淘汰过时记忆：
 
-```python
-CONSOLIDATE_THRESHOLD = 10
+```csharp
+private const int CONSOLIDATE_THRESHOLD = 10;
 
-def consolidate_memories():
-    files = list_memory_files()
-    if len(files) < CONSOLIDATE_THRESHOLD:
-        return  # 太少，不值得整理
-    # Send all memories to LLM, get back deduplicated list
-    # Replace all files with consolidated results
+public async Task<bool> ConsolidateIfNeededAsync(CancellationToken ct = default)
+{
+    var files = _store.List();
+    if (files.Count < _threshold) return false;  // Too few, not worth consolidating
+    // Send all memories to LLM, get back deduplicated list
+    // Replace all files with consolidated results
+}
 ```
 
 CC 把这个过程叫 Dream，实际有四层门控：时间间隔、扫描节流、会话数、文件锁。教学版简化为文件数阈值。

@@ -13,21 +13,20 @@ s01 → ... → s08 → s09 → `s10` → [s11](../s11_error_recovery/) → s12 
 
 s01 から s09 まで、system prompt は常に 1 行のハードコード：
 
-```python
-SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks."
+```csharp
+var SYSTEM = $"You are a coding agent at {workDir}. Use tools to solve tasks.";
 ```
 
 s01 では十分だった。bash、read、write の 3 ツールのみ。しかし s09 では、Agent に記憶、圧縮、スキル読み込みがある。prompt が説明すべき能力が増え続ける：
 
-```python
-SYSTEM = (
-    f"You are a coding agent at {WORKDIR}. "
-    "Use tools to solve tasks. Act, don't explain. "
-    "Before starting any multi-step task, use todo_write. "
-    "Skills are available via list_skills and load_skill. "
-    "Relevant memories are injected below when available. "
-    # ... 能力を追加するたびに 1 行増える
-)
+```csharp
+var SYSTEM =
+    $"You are a coding agent at {workDir}. "
+    + "Use tools to solve tasks. Act, don't explain. "
+    + "Before starting any multi-step task, use todo_write. "
+    + "Skills are available via list_skills and load_skill. "
+    + "Relevant memories are injected below when available. ";
+// ... add a capability, add a line
 ```
 
 3 つの問題：
@@ -65,13 +64,14 @@ s10 は prompt アセンブリ機構に焦点を当てる。s08-s09 の能力を
 
 単一の文字列を辞書に分割、各キーがトピック：
 
-```python
-PROMPT_SECTIONS = {
-    "identity": "You are a coding agent. Act, don't explain.",
-    "tools": "Available tools: bash, read_file, write_file.",
-    "workspace": f"Working directory: {WORKDIR}",
-    "memory": "Relevant memories are injected below when available.",
-}
+```csharp
+var sections = new Dictionary<string, string>
+{
+    ["identity"] = "You are a coding agent. Act, don't explain.",
+    ["tools"] = "Available tools: bash, read_file, write_file, edit_file, glob.",
+    ["workspace"] = $"Working directory: {workDir}",
+    ["memory"] = "Relevant memories are injected below when available.",
+};
 ```
 
 各セクションは独立して管理。`tools` を変更しても `identity` に影響しない。`memory` を追加しても `workspace` はそのまま。
@@ -80,21 +80,16 @@ PROMPT_SECTIONS = {
 
 すべてのセクションが毎ターン必要なわけではない。記憶ファイルがなければ、memory セクションをロードしても token の無駄。context の実際の状態に基づいて組み立てる：
 
-```python
-def assemble_system_prompt(context: dict) -> str:
-    sections = []
-
-    # 常にロード
-    sections.append(PROMPT_SECTIONS["identity"])
-    sections.append(PROMPT_SECTIONS["tools"])
-    sections.append(PROMPT_SECTIONS["workspace"])
-
-    # オンデマンド — 実際の状態に基づく、キーワードではない
-    memories = context.get("memories", "")
-    if memories:
-        sections.append(f"Relevant memories:\n{memories}")
-
-    return "\n\n".join(sections)
+```csharp
+var assemble = (Dictionary<string, object> ctx) =>
+{
+    var parts = new List<string> { sections["identity"], sections["tools"], sections["workspace"] };
+    if (ctx.TryGetValue("memories", out var m) && m is string ms && !string.IsNullOrEmpty(ms))
+    {
+        parts.Add($"Relevant memories:\n{ms}");
+    }
+    return string.Join("\n\n", parts);
+};
 ```
 
 「常にロード」は毎ターン必要なもの：アイデンティティ、ツール、作業ディレクトリ。「オンデマンド」は特定条件下でのみ有用。
@@ -105,15 +100,30 @@ def assemble_system_prompt(context: dict) -> str:
 
 コンテキストが変わっていない時（同じターン内で複数の LLM 呼び出し、context が同じ）、再組み立ては無駄。確定的シリアライズで変化を検出し、キャッシュヒット時は即座に返却：
 
-```python
-def get_system_prompt(context: dict) -> str:
-    global _last_context_key, _last_prompt
-    key = json.dumps(context, sort_keys=True, ensure_ascii=False, default=str)
-    if key == _last_context_key and _last_prompt:
-        return _last_prompt
-    _last_context_key = key
-    _last_prompt = assemble_system_prompt(context)
-    return _last_prompt
+```csharp
+string? lastKey = null;
+string? lastPrompt = null;
+var getPrompt = (Dictionary<string, object> ctx) =>
+{
+    var key = JsonSerializer.Serialize(ctx, new JsonSerializerOptions
+    {
+        WriteIndented = false,
+    });
+    if (key == lastKey && lastPrompt is not null)
+    {
+        Console.WriteLine("  \u001b[90m[cache hit] system prompt unchanged\u001b[0m");
+        return lastPrompt;
+    }
+    lastKey = key;
+    lastPrompt = assemble(ctx);
+    var loaded = new List<string> { "identity", "tools", "workspace" };
+    if (ctx.TryGetValue("memories", out var m) && m is string ms && !string.IsNullOrEmpty(ms))
+    {
+        loaded.Add("memory");
+    }
+    Console.WriteLine($"  \u001b[32m[assembled] sections: {string.Join(", ", loaded)}\u001b[0m");
+    return lastPrompt;
+};
 ```
 
 `hash()` ではなく `json.dumps` を使用：Python 組み込みの `hash()` にはプロセスランダム化があり（安定したキャッシュキーに不適切）、list/dict で `unhashable type` エラーになる。
@@ -124,34 +134,35 @@ def get_system_prompt(context: dict) -> str:
 
 context は現在の実行時状態の実際の状態を反映：
 
-```python
-def update_context(context: dict, messages: list) -> dict:
-    memories = ""
-    if MEMORY_INDEX.exists():
-        content = MEMORY_INDEX.read_text().strip()
-        if content:
-            memories = content
-    return {
-        "enabled_tools": list(TOOL_HANDLERS.keys()),
-        "workspace": str(WORKDIR),
-        "memories": memories,
-    }
+```csharp
+var updateContext = () =>
+{
+    var memIndex = File.Exists(indexPath) ? File.ReadAllText(indexPath).Trim() : "";
+    return new Dictionary<string, object>
+    {
+        ["enabled_tools"] = tools.All().Select(t => t.Name).ToList(),
+        ["workspace"] = workDir,
+        ["memories"] = memIndex,
+    };
+};
 ```
 
 `enabled_tools` は実際に登録されたツールを一覧。`memories` は `.memory/MEMORY.md` が存在するかを確認。セクションの読み込みはこの実際の状態に基づき、メッセージ内のキーワード検索ではない。
 
 ### 組み合わせて実行
 
-```python
-def agent_loop(messages: list, context: dict):
-    system = get_system_prompt(context)
-    while True:
-        response = client.messages.create(
-            model=MODEL, system=system, messages=messages,
-            tools=TOOLS, max_tokens=8000)
-        # ... ツール実行 ...
-        context = update_context(context, messages)
-        system = get_system_prompt(context)
+```csharp
+var ctx = updateContext();
+var agent = new AgentHarness(client, tools, () => getPrompt(ctx))
+{
+    OnLog = Console.WriteLine,
+    Permissions = new AllowAllPermissions(),
+};
+agent.Hooks.OnPreToolUse(block =>
+{
+    ctx = updateContext();
+    return null;
+});
 ```
 
 各ループ反復の開始時に system prompt を取得。context が変わっていれば再組み立て、変わっていなければキャッシュを返却。

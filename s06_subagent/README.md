@@ -34,58 +34,63 @@ Agent 在修一个 bug。它读了 30 个文件来追踪调用链，中间聊了
 
 **spawn_subagent**，给子 Agent 一个全新的 messages 列表，跑自己的循环，只回传结论：
 
-```python
-def spawn_subagent(description: str) -> str:
-    # 子 Agent 的工具：基础工具，但没有 task（禁止递归）
-    sub_tools = [
-        {"name": "bash", ...}, {"name": "read_file", ...},
-        {"name": "write_file", ...}, {"name": "edit_file", ...},
-        {"name": "glob", ...},
-    ]
-    messages = [{"role": "user", "content": description}]  # 全新 messages[]
+```csharp
+// Sub-Agent tools: base tools, but no task (no recursion)
+var subTools = new ToolRegistry();
+BashTool.Register(subTools, workDir);
+FileTools.Register(subTools, workDir);
 
-    for _ in range(30):  # safety limit
-        response = client.messages.create(
-            model=MODEL, system=SUB_SYSTEM,
-            messages=messages, tools=sub_tools, max_tokens=8000,
-        )
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
-            break
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                blocked = trigger_hooks("PreToolUse", block)
-                if blocked:
-                    results.append({... "content": str(blocked)})
-                    continue
-                handler = SUB_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown"
-                trigger_hooks("PostToolUse", block, output)
-                results.append({... "content": output})
-        messages.append({"role": "user", "content": results})
+SubagentRunner SpawnSub() => new(
+    client, config, subTools,
+    $"You are a focused sub-agent at {workDir}. Complete the given task and return a concise final answer.",
+    msg => Console.WriteLine(msg));
 
-    # 只返回最后的文本结论，中间过程全部丢弃
-    return extract_text(messages[-1]["content"])
+// SubagentRunner: fresh messages[], own loop, return only the final text
+public async Task<string> RunAsync(string description, CancellationToken ct = default)
+{
+    _onLog?.Invoke("\n\u001b[35m[Subagent spawned]\u001b[0m");
+    var messages = new List<Message> { Message.UserText(description) };
+
+    LlmResponse? last = null;
+    for (var i = 0; i < _maxIterations; i++)  // safety limit
+    {
+        last = await _client.CreateMessageAsync(
+            _systemPrompt, messages, _tools.AllSpecs().ToList(), ct: ct);
+        messages.Add(Message.Assistant(last.Content));
+
+        if (last.StopReason != "tool_use") break;
+
+        var results = new List<ToolResultBlock>();
+        foreach (var block in last.Content.OfType<ToolUseBlock>())
+        {
+            var output = _tools.Invoke(block.Name, block.Input);
+            _onLog?.Invoke($"  \u001b[90m[sub] {block.Name}: {(output.Length > 100 ? output[..100] : output)}\u001b[0m");
+            results.Add(new ToolResultBlock(block.Id, output));
+        }
+        messages.Add(Message.UserToolResults(results));
+    }
+
+    // Return only the final text conclusion, all intermediate steps discarded
+    foreach (var b in last?.Content.OfType<TextBlock>() ?? Enumerable.Empty<TextBlock>())
+    {
+        _onLog?.Invoke("\u001b[35m[Subagent done]\u001b[0m");
+        return b.Text;
+    }
+    return $"Subagent stopped after {_maxIterations} turns without final answer.";
+}
 ```
 
 主 Agent 调用时，跟调其他工具一样：
 
-```python
-TOOLS = [
-    {"name": "bash", ...},
-    {"name": "read_file", ...},
-    {"name": "write_file", ...},
-    {"name": "edit_file", ...},
-    {"name": "glob", ...},
-    {"name": "todo_write", ...},
-    # s06: 新增 task 工具
-    {"name": "task",
-     "description": "Launch a subagent to handle a complex subtask. Returns only the final conclusion.",
-     "input_schema": {"type": "object", "properties": {"description": {"type": "string"}}, "required": ["description"]}},
-]
+```csharp
+var parentTools = new ToolRegistry();
+BashTool.Register(parentTools, workDir);
+FileTools.Register(parentTools, workDir);
+var todos = new TodoTools.TodoState();
+TodoTools.Register(parentTools, todos);
 
-TOOL_HANDLERS["task"] = spawn_subagent
+// s06: new task tool
+TaskTool.Register(parentTools, SpawnSub);
 ```
 
 三个关键设计决策：

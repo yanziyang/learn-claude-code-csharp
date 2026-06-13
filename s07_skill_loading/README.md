@@ -13,13 +13,12 @@ s01 → s02 → s03 → s04 → s05 → s06 → `s07` → [s08](../s08_context_c
 
 你的项目有一套 React 组件规范、一份 SQL 风格指南、一份 API 设计文档。你希望 Agent 自动遵守这些规范。最直接的想法，全塞进 system prompt：
 
-```python
-SYSTEM = (
-    f"You are a coding agent. "
-    + open("docs/react-style.md").read()       # 2000 行
-    + open("docs/sql-style.md").read()         # 1500 行
-    + open("docs/api-design.md").read()        # 3000 行
-)
+```csharp
+var SYSTEM =
+    $"You are a coding agent. "
+    + File.ReadAllText("docs/react-style.md")       // 2000 lines
+    + File.ReadAllText("docs/sql-style.md")         // 1500 lines
+    + File.ReadAllText("docs/api-design.md");       // 3000 lines
 ```
 
 6500 行 system prompt。Agent 每次调用 LLM 都带着这些文档——不管是在改 CSS 颜色还是修 SQL 查询。99% 的内容和当前任务无关，白白消耗 token。
@@ -57,47 +56,61 @@ skills/
 
 **第一级：启动时注入目录**：harness 启动时调用 `_scan_skills()` 扫描 skills/ 目录，解析每个 SKILL.md 的 YAML frontmatter（`name`、`description`），存入 `SKILL_REGISTRY` 字典。`list_skills()` 从注册表生成目录，注入 SYSTEM prompt。Agent 每轮都能看到"我有哪些技能可用"，不花额外 API 调用：
 
-```python
-SKILL_REGISTRY: dict[str, dict] = {}
+```csharp
+public sealed class SkillRegistry
+{
+    private readonly Dictionary<string, SkillManifest> _byName = new();
 
-def _scan_skills():
-    if not SKILLS_DIR.exists():
-        return
-    for d in sorted(SKILLS_DIR.iterdir()):
-        if not d.is_dir():
-            continue
-        manifest = d / "SKILL.md"
-        if manifest.exists():
-            raw = manifest.read_text()
-            meta, body = _parse_frontmatter(raw)
-            name = meta.get("name", d.name)
-            desc = meta.get("description", raw.split("\n")[0].lstrip("#").strip())
-            SKILL_REGISTRY[name] = {"name": name, "description": desc, "content": raw}
+    public static SkillRegistry LoadFromDir(string skillsDir)
+    {
+        var reg = new SkillRegistry();
+        if (!Directory.Exists(skillsDir)) return reg;
 
-_scan_skills()  # runs once at startup
+        foreach (var dir in Directory.EnumerateDirectories(skillsDir))
+        {
+            var manifest = Path.Combine(dir, "SKILL.md");
+            if (!File.Exists(manifest)) continue;
 
-def list_skills() -> str:
-    return "\n".join(f"- **{s['name']}**: {s['description']}" for s in SKILL_REGISTRY.values())
+            var raw = File.ReadAllText(manifest);
+            var (name, desc) = ParseFrontmatter(raw);
+            if (string.IsNullOrEmpty(name)) name = Path.GetFileName(dir);
+            reg._byName[name] = new SkillManifest
+            {
+                Name = name,
+                Description = desc,
+                FullContent = raw,
+            };
+        }
+        return reg;
+    }
 
-def build_system() -> str:
-    catalog = list_skills()
-    return (
-        f"You are a coding agent at {WORKDIR}. "
-        f"Skills available:\n{catalog}\n"
-        "Use load_skill to get full details when needed."
-    )
+    public string Catalog() =>
+        string.Join("\n", _byName.Values.Select(s => $"- **{s.Name}**: {s.Description}"));
+}
 
-SYSTEM = build_system()
+public sealed record SkillManifest
+{
+    public string Name { get; init; } = "";
+    public string Description { get; init; } = "";
+    public string FullContent { get; init; } = "";
+}
+
+var skills = SkillRegistry.LoadFromDir(skillsDir);  // runs once at startup
+
+var SYSTEM =
+    $"You are a coding agent at {workDir}. " +
+    "Skills available:\n" + skills.Catalog() + "\n" +
+    "Use load_skill to get full details when needed.";
 ```
 
 **第二级：load_skill**：Agent 决定"我需要 SQL 风格指南"，调用 `load_skill("sql-style")`。通过注册表查找，不走文件路径，没有路径遍历风险。SKILL.md 内容通过 `tool_result` 注入，并可通过现有的 file 和 bash 工具进一步访问引用的 `references/`、`scripts/` 或 `assets/`。
 
-```python
-def load_skill(name: str) -> str:
-    skill = SKILL_REGISTRY.get(name)
-    if not skill:
-        return f"Skill not found: {name}"
-    return skill["content"]
+```csharp
+public static string LoadSkill(string name, SkillRegistry registry)
+{
+    var skill = registry.Get(name);
+    return skill is null ? $"Skill not found: {name}" : skill.FullContent;
+}
 ```
 
 关键区别：技能内容不是 system prompt 的一部分，它作为一次工具结果进入当前 messages。后续调用会随历史一起携带，直到上下文压缩、截断或会话结束。这和 s08 的 compact 自然衔接：按需加载解决了"不该提前带的不要带"，compact 解决"该丢的怎么丢"。

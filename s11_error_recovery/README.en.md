@@ -47,24 +47,30 @@ The model runs out of tokens mid-sentence — `max_tokens` is exhausted. The def
 
 On the first occurrence, escalate `max_tokens` from 8K to 64K (8x the space) and retry the same request — the truncated output is NOT appended to messages, keeping the original request intact. If 64K is still not enough, save the truncated output and inject a continuation prompt telling the model to pick up where it left off, up to 3 times:
 
-```python
-if response.stop_reason == "max_tokens":
-    # First escalation: don't append truncated output, retry same request
-    if not state.has_escalated:
-        max_tokens = ESCALATED_MAX_TOKENS
-        state.has_escalated = True
-        continue  # messages unchanged, same request with more tokens
-    # 64K still truncated: save output + continuation prompt
-    messages.append({"role": "assistant", "content": response.content})
-    if state.recovery_count < MAX_RECOVERY_RETRIES:
-        messages.append({"role": "user", "content":
-            "Output token limit hit. Resume directly — "
-            "no apology, no recap. Pick up mid-thought."})
-        state.recovery_count += 1
-        continue
-    return  # still truncated after 3 continuations
-# Normal: append after max_tokens check
-messages.append({"role": "assistant", "content": response.content})
+```csharp
+if (response.StopReason == "max_tokens")
+{
+    // First escalation: don't append truncated output, retry same request
+    if (!hasEscalated)
+    {
+        maxTokens = ESCALATED_MAX_TOKENS;
+        hasEscalated = true;
+        continue;  // messages unchanged, same request with more tokens
+    }
+    // 64K still truncated: save output + continuation prompt
+    messages.Add(Message.Assistant(response.Content));
+    if (recoveryCount < MAX_RECOVERY_RETRIES)
+    {
+        messages.Add(Message.UserText(
+            "Output token limit hit. Resume directly — " +
+            "no apology, no recap. Pick up mid-thought."));
+        recoveryCount++;
+        continue;
+    }
+    return;  // still truncated after 3 continuations
+}
+// Normal: append after max_tokens check
+messages.Add(Message.Assistant(response.Content));
 ```
 
 Escalation gets one chance; continuation gets up to 3. After that, exit — further continuations won't produce meaningful output.
@@ -75,13 +81,19 @@ The LLM says "your context is too long" (`prompt_too_long`). All four compaction
 
 Trigger reactive compact — more aggressive than auto compact. The teaching version keeps only the last 5 messages to simulate compaction; real CC generates a compact summary via LLM, then retries with the compacted message list. Retry after compacting. But if it's still over the limit after one compaction, the only option is to exit — compacting again won't make it any smaller:
 
-```python
-except PromptTooLongError:
-    if not state.has_attempted_reactive_compact:
-        messages[:] = reactive_compact(messages)
-        state.has_attempted_reactive_compact = True
-        continue
-    return  # Already compacted and still over limit — must exit
+```csharp
+catch (InvalidOperationException ex) when (IsPromptTooLong(ex))
+{
+    if (!hasAttemptedReactiveCompact)
+    {
+        var compacted = await compactor.EmergencyAsync(messages, ct);
+        messages.Clear();
+        messages.AddRange(compacted);
+        hasAttemptedReactiveCompact = true;
+        continue;
+    }
+    return;  // Already compacted and still over limit — must exit
+}
 ```
 
 ### Path 3: Transient Failures
@@ -90,71 +102,100 @@ Network blips, 429 rate limiting, 529 overload — these aren't bugs, they're no
 
 Both 429 and 529 use exponential backoff + jitter: wait 0.5 seconds on the first attempt, 1 second on the second, 2 seconds on the third, up to 10 retries. Random jitter prevents concurrent requests from all retrying at the same instant. Three consecutive 529 overload errors → switch to the fallback model (if `FALLBACK_MODEL_ID` environment variable is configured):
 
-```python
-def retry_delay(attempt, retry_after=None):
-    if retry_after:
-        return retry_after
-    base = min(500 * (2 ** attempt), 32000) / 1000
-    return base + random.uniform(0, base * 0.25)
+```csharp
+static double RetryDelay(int attempt, double? retryAfter = null)
+{
+    if (retryAfter.HasValue) return retryAfter.Value;
+    var baseDelay = Math.Min(500 * Math.Pow(2, attempt), 32_000) / 1000.0;
+    return baseDelay + Random.Shared.NextDouble() * baseDelay * 0.25;
+}
 
-def with_retry(fn, state, max_retries=10):
-    for attempt in range(max_retries):
-        try:
-            return fn()
-        except (RateLimitError, OverloadedError):
-            delay = retry_delay(attempt)
-            time.sleep(delay)
-            if is_overloaded:
-                state.consecutive_529 += 1
-                if state.consecutive_529 >= 3 and FALLBACK_MODEL:
-                    state.current_model = FALLBACK_MODEL
-    raise MaxRetriesExceeded()
+async Task<T> WithRetry<T>(Func<Task<T>> fn, RetryState state, int maxRetries = 10)
+{
+    for (var attempt = 0; attempt < maxRetries; attempt++)
+    {
+        try
+        {
+            return await fn();
+        }
+        catch (InvalidOperationException ex) when (IsRateLimited(ex) || IsOverloaded(ex))
+        {
+            await Task.Delay(TimeSpan.FromSeconds(RetryDelay(attempt)));
+            if (IsOverloaded(ex))
+            {
+                state.ConsecutiveOverloaded++;
+                if (state.ConsecutiveOverloaded >= 3 && FallbackModel is { } fb)
+                {
+                    state.CurrentModel = fb;
+                }
+            }
+        }
+    }
+    throw new InvalidOperationException("Max retries exceeded");
+}
 ```
 
 Backoff formula: `min(500 × 2^attempt, 32000) + random(0~25%)`. If the server returns a `Retry-After` header, that value takes priority.
 
 ### Putting It All Together
 
-```python
-def agent_loop(messages, context):
-    system = get_system_prompt(context)
-    state = RecoveryState()
-    max_tokens = 8000
+```csharp
+async Task AgentLoopAsync(List<Message> messages, string workDir, CancellationToken ct)
+{
+    var system = GetSystemPrompt(workDir);
+    var state = new RecoveryState();
+    int maxTokens = 8000;
 
-    while True:
-        try:
-            response = with_retry(
-                lambda: client.messages.create(
-                    model=state.current_model, system=system,
-                    messages=messages, tools=TOOLS,
-                    max_tokens=max_tokens),
-                state)
-        except Exception as e:
-            if is_prompt_too_long_error(e):
-                if not state.has_attempted_reactive_compact:
-                    messages[:] = reactive_compact(messages)
-                    state.has_attempted_reactive_compact = True
-                    continue
-                return
-            log_error(e)
-            return
+    LlmResponse response;
+    while (true)
+    {
+        try
+        {
+            response = await WithRetry(
+                () => client.CreateMessageAsync(
+                    system, messages, Tools.AllSpecs().ToList(),
+                    maxTokens, state.CurrentModel, ct),
+                state);
+        }
+        catch (Exception e)
+        {
+            if (IsPromptTooLongError(e))
+            {
+                if (!state.HasAttemptedReactiveCompact)
+                {
+                    var compacted = await compactor.EmergencyAsync(messages, ct);
+                    messages.Clear();
+                    messages.AddRange(compacted);
+                    state.HasAttemptedReactiveCompact = true;
+                    continue;
+                }
+                return;
+            }
+            LogError(e);
+            return;
+        }
 
-        # max_tokens check BEFORE appending to messages
-        if response.stop_reason == "max_tokens":
-            if not state.has_escalated:
-                max_tokens = 64000
-                state.has_escalated = True
-                continue  # retry same request, messages unchanged
-            # save truncated output + continuation prompt
-            messages.append({"role": "assistant", "content": response.content})
-            messages.append({"role": "user", "content": CONTINUATION_PROMPT})
-            continue
-        # Normal completion
-        messages.append({"role": "assistant", "content": response.content})
+        // max_tokens check BEFORE appending to messages
+        if (response.StopReason == "max_tokens")
+        {
+            if (!state.HasEscalated)
+            {
+                maxTokens = 64_000;
+                state.HasEscalated = true;
+                continue;  // retry same request, messages unchanged
+            }
+            // save truncated output + continuation prompt
+            messages.Add(Message.Assistant(response.Content));
+            messages.Add(Message.UserText(CONTINUATION_PROMPT));
+            continue;
+        }
+        // Normal completion
+        messages.Add(Message.Assistant(response.Content));
 
-        if response.stop_reason != "tool_use":
-            return
-        # ... tool execution ...
+        if (response.StopReason != "tool_use") return;
+        // ... tool execution ...
+    }
+}
 ```
 
 The outer try/except catches API exceptions (prompt_too_long, etc.), `with_retry` handles transient errors (429/529), and `stop_reason` checks handle truncation. Three recovery mechanisms, each handling its own error type.

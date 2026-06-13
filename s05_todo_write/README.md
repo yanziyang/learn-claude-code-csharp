@@ -34,62 +34,28 @@ dispatch 机制不变，新工具仍然走 `TOOL_HANDLERS[block.name]` 分发。
 
 **todo_write 工具**，接收一个带状态的列表，保存在当前进程内存中，同时在终端显示进度：
 
-```python
-CURRENT_TODOS: list[dict] = []
+```csharp
+var state = new TodoTools.TodoState();
 
-def run_todo_write(todos: list) -> str:
-    global CURRENT_TODOS
-    CURRENT_TODOS = todos
-
-    lines = ["\n## Current Tasks"]
-    for t in CURRENT_TODOS:
-        icon = {"pending": " ", "in_progress": "▸", "completed": "✓"}[t["status"]]
-        lines.append(f"  [{icon}] {t['content']}")
-    print("\n".join(lines))
-    return f"Updated {len(CURRENT_TODOS)} tasks"
+TodoTools.Register(tools, state);
 ```
 
 工具定义和其他 5 个工具一起加入 dispatch map：
 
-```python
-TOOLS = [
-    {"name": "bash",       ...},
-    {"name": "read_file",  ...},
-    {"name": "write_file", ...},
-    {"name": "edit_file",  ...},
-    {"name": "glob",       ...},
-    # s05: 新增一条
-    {"name": "todo_write", "description": "Create and manage a task list ...",
-     "input_schema": {
-         "type": "object",
-         "properties": {
-             "todos": {
-                 "type": "array",
-                 "items": {
-                     "type": "object",
-                     "properties": {
-                         "content": {"type": "string"},
-                         "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
-                     },
-                 },
-             },
-         },
-     },
-    },
-]
-
-TOOL_HANDLERS["todo_write"] = run_todo_write
+```csharp
+BashTool.Register(tools, workDir);
+FileTools.Register(tools, workDir);
+TodoTools.Register(tools, state);   // s05: new tool
 ```
 
 **Nag reminder**，模型连续 3 轮没调 `todo_write` 时，自动注入一条提醒（教学版机制，CC 源码中没有这个固定轮数逻辑）：
 
-```python
-if rounds_since_todo >= 3 and messages:
-    messages.append({
-        "role": "user",
-        "content": "<reminder>Update your todos.</reminder>",
-    })
-    rounds_since_todo = 0
+```csharp
+if (++roundsSinceTodo >= 3 && messages.Count > 0)
+{
+    messages.Add(Message.UserText("<reminder>Update your todos.</reminder>"));
+    roundsSinceTodo = 0;
+}
 ```
 
 Agent 收到任务后的典型流程：先调 `todo_write` 列出所有步骤（全 `pending`）→ 做一个步骤，改成 `in_progress` → 做完改成 `completed` → 看下一个 `pending` → 继续。连续 3 轮没有调用 `todo_write` 时，循环会在下一次 LLM 调用前追加一条 reminder。

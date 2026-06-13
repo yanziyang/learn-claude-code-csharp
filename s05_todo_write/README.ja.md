@@ -34,62 +34,28 @@ Agent は作業を開始する。3 つのファイルをリネーム、テスト
 
 **todo_write ツール**は、ステータス付きのリストを受け取り、現在のプロセスメモリに保持し、端末に進捗を表示する：
 
-```python
-CURRENT_TODOS: list[dict] = []
+```csharp
+var state = new TodoTools.TodoState();
 
-def run_todo_write(todos: list) -> str:
-    global CURRENT_TODOS
-    CURRENT_TODOS = todos
-
-    lines = ["\n## Current Tasks"]
-    for t in CURRENT_TODOS:
-        icon = {"pending": " ", "in_progress": "▸", "completed": "✓"}[t["status"]]
-        lines.append(f"  [{icon}] {t['content']}")
-    print("\n".join(lines))
-    return f"Updated {len(CURRENT_TODOS)} tasks"
+TodoTools.Register(tools, state);
 ```
 
 ツール定義は他の 5 つと一緒にディスパッチマップに追加される：
 
-```python
-TOOLS = [
-    {"name": "bash",       ...},
-    {"name": "read_file",  ...},
-    {"name": "write_file", ...},
-    {"name": "edit_file",  ...},
-    {"name": "glob",       ...},
-    # s05: 新規追加
-    {"name": "todo_write", "description": "Create and manage a task list ...",
-     "input_schema": {
-         "type": "object",
-         "properties": {
-             "todos": {
-                 "type": "array",
-                 "items": {
-                     "type": "object",
-                     "properties": {
-                         "content": {"type": "string"},
-                         "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
-                     },
-                 },
-             },
-         },
-     },
-    },
-]
-
-TOOL_HANDLERS["todo_write"] = run_todo_write
+```csharp
+BashTool.Register(tools, workDir);
+FileTools.Register(tools, workDir);
+TodoTools.Register(tools, state);   // s05: new tool
 ```
 
 **Nag リマインダー**、モデルが連続 3 ラウンド `todo_write` を呼び出さないとき、リマインダーが自動的に注入される（教育用機構、CC ソースコードに固定ラウンド数のロジックはない）：
 
-```python
-if rounds_since_todo >= 3 and messages:
-    messages.append({
-        "role": "user",
-        "content": "<reminder>Update your todos.</reminder>",
-    })
-    rounds_since_todo = 0
+```csharp
+if (++roundsSinceTodo >= 3 && messages.Count > 0)
+{
+    messages.Add(Message.UserText("<reminder>Update your todos.</reminder>"));
+    roundsSinceTodo = 0;
+}
 ```
 
 Agent がタスクを受け取った後の典型的な流れ：まず `todo_write` を呼び出して全手順を列挙（全て `pending`）→ 一つの手順に取り掛かり、`in_progress` に変更 → 完了したら `completed` に変更 → 次の `pending` を見る → 続行。3 ラウンド `todo_write` がない場合、次の LLM 呼び出し前にリマインダーが追加される。

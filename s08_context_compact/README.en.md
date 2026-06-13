@@ -41,19 +41,32 @@ The agent ran 80 turns of conversation, accumulating 160 `messages`. The very fi
 
 Message count exceeds 50 → keep the first 3 (initial context) and the last 47 (current work), trim the middle; the only extra boundary rule is that `assistant(tool_use)` must not be separated from the following `user(tool_result)`:
 
-```python
-def snip_compact(messages, max_messages=50):
-    if len(messages) <= max_messages:
-        return messages
-    head_end, tail_start = 3, len(messages) - (max_messages - 3)
-    if _message_has_tool_use(messages[head_end - 1]):
-        while head_end < len(messages) and _is_tool_result_message(messages[head_end]):
-            head_end += 1
-    if _is_tool_result_message(messages[tail_start]) and _message_has_tool_use(messages[tail_start - 1]):
-        tail_start -= 1
-    snipped = tail_start - head_end
-    placeholder = {"role": "user", "content": f"[snipped {snipped} messages from conversation middle]"}
-    return messages[:head_end] + [placeholder] + messages[tail_start:]
+```csharp
+private void SnipCompact(List<Message> messages)
+{
+    if (messages.Count <= _maxMessages) return;
+    var keepHead = _keepHead;
+    var tailStart = messages.Count - _keepTail;
+
+    if (keepHead > 0 && keepHead < messages.Count && MessageHasToolUse(messages[keepHead - 1]))
+    {
+        while (keepHead < messages.Count && IsToolResultMessage(messages[keepHead]))
+        {
+            keepHead++;
+        }
+    }
+    if (tailStart > 0 && tailStart < messages.Count
+        && IsToolResultMessage(messages[tailStart])
+        && MessageHasToolUse(messages[tailStart - 1]))
+    {
+        tailStart--;
+    }
+    if (keepHead >= tailStart) return;
+
+    var snipped = tailStart - keepHead;
+    messages.RemoveRange(keepHead, snipped);
+    messages.Insert(keepHead, Message.UserText($"[snipped {snipped} messages]"));
+}
 ```
 
 Messages are still trimmed directly; this just adds one boundary guard. `tool_result` content within remaining messages still keeps accumulating — message #34 may still hold 30KB of old file contents. → L2.
@@ -66,17 +79,35 @@ The agent read 10 files consecutively. The full contents of reads 1–7 are stil
 
 Keep only the 3 most recent `tool_result` entries intact; replace older ones with a one-line placeholder:
 
-```python
-KEEP_RECENT_TOOL_RESULTS = 3
+```csharp
+private const int KEEP_RECENT_TOOL_RESULTS = 3;
 
-def micro_compact(messages):
-    tool_results = collect_tool_result_blocks(messages)
-    if len(tool_results) <= KEEP_RECENT_TOOL_RESULTS:
-        return messages
-    for _, _, block in tool_results[:-KEEP_RECENT_TOOL_RESULTS]:
-        if len(block.get("content", "")) > 120:
-            block["content"] = "[Earlier tool result compacted. Re-run if needed.]"
-    return messages
+private void MicroCompact(List<Message> messages)
+{
+    var allResults = new List<(int mi, int bi, ToolResultBlock block)>();
+    for (var mi = 0; mi < messages.Count; mi++)
+    {
+        var m = messages[mi];
+        if (m.Role != "user") continue;
+        for (var bi = 0; bi < m.Content.Count; bi++)
+        {
+            if (m.Content[bi] is ToolResultBlock tr) allResults.Add((mi, bi, tr));
+        }
+    }
+    if (allResults.Count <= _keepRecentToolResults) return;
+
+    foreach (var (mi, bi, block) in allResults.Take(allResults.Count - _keepRecentToolResults))
+    {
+        if ((block.Content?.Length ?? 0) > 120)
+        {
+            var replaced = new ToolResultBlock(
+                block.ToolUseId,
+                "[Earlier tool result compacted. Re-run if needed.]",
+                block.IsError);
+            messages[mi].Content[bi] = replaced;
+        }
+    }
+}
 ```
 
 Old results are cleared, but a single new result can be 500KB — one `cat` of a large file can max out the context. → L3.
@@ -89,21 +120,34 @@ The model read 5 large files in one go; all `tool_result` blocks in the last use
 
 Sum the size of all `tool_result` blocks in the last user message. If over 200KB → sort by size, starting from the largest, persist to `.task_outputs/tool-results/`, keeping only a `<persisted-output>` marker + a 2000-character preview in context. The model sees the marker and knows the full content is on disk, re-reading it when needed.
 
-```python
-def tool_result_budget(messages, max_bytes=200_000):
-    last = messages[-1]
-    blocks = [(i, b) for i, b in enumerate(last["content"])
-              if b.get("type") == "tool_result"]
-    total = sum(len(str(b.get("content", ""))) for _, b in blocks)
-    if total <= max_bytes:
-        return messages
-    ranked = sorted(blocks, key=lambda p: len(str(p[1].get("content", ""))), reverse=True)
-    for idx, block in ranked:
-        if total <= max_bytes:
-            break
-        block["content"] = persist_large_output(block["tool_use_id"], str(block["content"]))
-        total = recalculate_total(blocks)
-    return messages
+```csharp
+private void ToolResultBudget(List<Message> messages)
+{
+    if (messages.Count == 0) return;
+    var last = messages[^1];
+    if (last.Role != "user") return;
+    var blocks = last.Content.OfType<ToolResultBlock>().ToList();
+    if (blocks.Count == 0) return;
+
+    long total = blocks.Sum(b => b.Content?.Length ?? 0);
+    if (total <= _toolResultBudgetBytes) return;
+
+    var ranked = blocks.OrderByDescending(b => b.Content?.Length ?? 0).ToList();
+    foreach (var block in ranked)
+    {
+        if (total <= _toolResultBudgetBytes) break;
+        var content = block.Content ?? "";
+        if (content.Length <= _persistThreshold) continue;
+        var tid = string.IsNullOrEmpty(block.ToolUseId) ? Guid.NewGuid().ToString("n") : block.ToolUseId;
+        var persisted = PersistLargeOutput(tid, content);
+        var idx = last.Content.IndexOf(block);
+        if (idx >= 0)
+        {
+            last.Content[idx] = new ToolResultBlock(block.ToolUseId, persisted, block.IsError);
+            total = last.Content.OfType<ToolResultBlock>().Sum(b => b.Content?.Length ?? 0);
+        }
+    }
+}
 ```
 
 The first three layers are all plain-text / structural operations — 0 API calls — but they cannot "understand" conversation content. Context may still be too large. → L4.
@@ -120,12 +164,13 @@ Three-step process:
 2. **LLM generates summary**: Send conversation history to the LLM, asking it to preserve key information: current goals, important findings, modified files, remaining work, user constraints, etc.
 3. **Replace message list**: All old messages are replaced with a single summary. The teaching version only keeps the summary; the real Claude Code re-attaches some recent files, plans, agent/skill/tool context after compaction.
 
-```python
-def compact_history(messages):
-    transcript_path = write_transcript(messages)  # Save full conversation first
-    summary = summarize_history(messages)          # LLM generates summary
-    return [{"role": "user",
-             "content": f"[Compacted]\n\n{summary}"}]
+```csharp
+public async Task<List<Message>> CompactHistoryAsync(List<Message> messages, CancellationToken ct = default)
+{
+    var transcriptPath = WriteTranscript(messages);  // Save full conversation first
+    var summary = await SummarizeHistoryAsync(messages, ct);  // LLM generates summary
+    return new List<Message> { Message.UserText($"[Compacted]\n\n{summary}") };
+}
 ```
 
 **Circuit breaker**: After 3 consecutive failures, stop retrying to prevent an infinite loop wasting API calls.
@@ -136,51 +181,72 @@ Sometimes the API still returns `prompt_too_long` (413) — when context grows f
 
 This triggers **reactive_compact**: more aggressive than compact_history, it retreats from the tail, but still avoids leaving an orphaned `tool_result`.
 
-```python
-def reactive_compact(messages):
-    transcript = write_transcript(messages)
-    summary = summarize_history(messages)
-    tail_start = max(0, len(messages) - 5)
-    if _is_tool_result_message(messages[tail_start]) and _message_has_tool_use(messages[tail_start - 1]):
-        tail_start -= 1
-    return [{"role": "user",
-             "content": f"[Reactive compact]\n\n{summary}"}, *messages[tail_start:]]
+```csharp
+public async Task<List<Message>> EmergencyAsync(List<Message> messages, CancellationToken ct = default)
+{
+    var transcriptPath = WriteTranscript(messages);
+    var summary = await SummarizeHistoryAsync(messages, ct);
+
+    var tailStart = Math.Max(0, messages.Count - 5);
+    if (tailStart > 0 && tailStart < messages.Count
+        && IsToolResultMessage(messages[tailStart])
+        && MessageHasToolUse(messages[tailStart - 1]))
+    {
+        tailStart -= 1;
+    }
+    return new List<Message> { Message.UserText($"[Reactive compact]\n\n{summary}") }
+        .Concat(messages.Skip(tailStart))
+        .ToList();
+}
 ```
 
 Reactive compact has a retry limit (default 1). If it still fails, an exception is raised instead of looping forever. Full error recovery is deferred to s11.
 
 ### Putting It All Together
 
-```python
-def agent_loop(messages):
-    reactive_retries = 0
-    while True:
-        # Three pre-processors (0 API calls)
-        # Order: budget first, so large content is persisted before placeholders
-        messages[:] = tool_result_budget(messages)    # L3: persist large results
-        messages[:] = snip_compact(messages)          # L1: trim middle
-        messages[:] = micro_compact(messages)         # L2: old result placeholders
+```csharp
+public async Task<LlmResponse> RunAsync(List<Message> messages, CancellationToken ct = default)
+{
+    // L1, L2, L3: 0 API calls
+    Hooks.FireBeforeLlmCall(messages);
+    Compactor.PrepareBeforeLlm(messages);
 
-        # Still too much? LLM summary (1 API call)
-        if estimate_token_count(messages) > THRESHOLD:
-            messages[:] = compact_history(messages)
+    var systemPrompt = SystemPromptProvider?.Invoke() ?? "";
+    LlmResponse response;
+    try
+    {
+        response = await Client.CreateMessageAsync(
+            systemPrompt, messages, Tools.AllSpecs().ToList(), ct: ct);
+    }
+    catch (InvalidOperationException ex) when (IsPromptTooLong(ex))
+    {
+        // emergency
+        messages.Clear();
+        messages.AddRange(await Compactor.EmergencyAsync(messages, ct));
+        response = await Client.CreateMessageAsync(
+            systemPrompt, messages, Tools.AllSpecs().ToList(), ct: ct);
+        // retry limit exceeded, raise exception
+    }
 
-        try:
-            response = client.messages.create(...)
-        except PromptTooLongError:
-            if reactive_retries < MAX_REACTIVE_RETRIES:
-                messages[:] = reactive_compact(messages)  # Emergency
-                reactive_retries += 1
-                continue
-            raise  # retry limit exceeded, raise exception
-        # ... tool execution ...
+    messages.Add(Message.Assistant(response.Content));
 
-        # compact tool: when the model actively calls it, triggers compact_history
-        if block.name == "compact":
-            messages[:] = compact_history(messages)
-            results.append({..., "content": "[Compacted. History summarized.]"})
-            messages.append({"role": "user", "content": results})
-            break  # end current turn, start fresh with compacted context
+    if (response.StopReason != "tool_use") return response;
+
+    // tool execution
+    var results = new List<ToolResultBlock>();
+    foreach (var block in response.Content.OfType<ToolUseBlock>())
+    {
+        OnLog?.Invoke($"\u001b[33m> {block.Name}\u001b[0m");
+        var blocked = Hooks.FirePreToolUse(block);
+        var output = blocked ?? Tools.Invoke(block.Name, block.Input);
+        Hooks.FirePostToolUse(block, output);
+        OnLog?.Invoke(output.Length > 200 ? output[..200] : output);
+        results.Add(new ToolResultBlock(block.Id, output));
+    }
+
+    messages.Add(Message.UserToolResults(results));
+    return response;
+}
 ```
 
 **The order must not be swapped.** L3 (budget) runs before L2 (micro) because micro replaces old large tool_results with one-line placeholders — budget must persist the full content before that happens. This is why CC source puts `applyToolResultBudget` first.

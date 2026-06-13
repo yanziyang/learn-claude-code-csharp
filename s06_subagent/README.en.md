@@ -34,54 +34,63 @@ The sub-Agent's tools are restricted: it has bash/read/write/edit/glob, but no t
 
 **spawn_subagent**, gives the sub-Agent a fresh messages list, runs its own loop, returns only the conclusion:
 
-```python
-def spawn_subagent(description: str) -> str:
-    # Sub-Agent tools: base tools, but no task (no recursion)
-    sub_tools = [...]
-    messages = [{"role": "user", "content": description}]  # fresh messages[]
+```csharp
+// Sub-Agent tools: base tools, but no task (no recursion)
+var subTools = new ToolRegistry();
+BashTool.Register(subTools, workDir);
+FileTools.Register(subTools, workDir);
 
-    for _ in range(30):  # safety limit
-        response = client.messages.create(
-            model=MODEL, system=SUB_SYSTEM,
-            messages=messages, tools=sub_tools, max_tokens=8000,
-        )
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
-            break
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                blocked = trigger_hooks("PreToolUse", block)
-                if blocked:
-                    results.append({... "content": str(blocked)})
-                    continue
-                handler = SUB_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown"
-                trigger_hooks("PostToolUse", block, output)
-                results.append({... "content": output})
-        messages.append({"role": "user", "content": results})
+SubagentRunner SpawnSub() => new(
+    client, config, subTools,
+    $"You are a focused sub-agent at {workDir}. Complete the given task and return a concise final answer.",
+    msg => Console.WriteLine(msg));
 
-    # Return only the final text conclusion, all intermediate steps discarded
-    return extract_text(messages[-1]["content"])
+// SubagentRunner: fresh messages[], own loop, return only the final text
+public async Task<string> RunAsync(string description, CancellationToken ct = default)
+{
+    _onLog?.Invoke("\n\u001b[35m[Subagent spawned]\u001b[0m");
+    var messages = new List<Message> { Message.UserText(description) };
+
+    LlmResponse? last = null;
+    for (var i = 0; i < _maxIterations; i++)  // safety limit
+    {
+        last = await _client.CreateMessageAsync(
+            _systemPrompt, messages, _tools.AllSpecs().ToList(), ct: ct);
+        messages.Add(Message.Assistant(last.Content));
+
+        if (last.StopReason != "tool_use") break;
+
+        var results = new List<ToolResultBlock>();
+        foreach (var block in last.Content.OfType<ToolUseBlock>())
+        {
+            var output = _tools.Invoke(block.Name, block.Input);
+            _onLog?.Invoke($"  \u001b[90m[sub] {block.Name}: {(output.Length > 100 ? output[..100] : output)}\u001b[0m");
+            results.Add(new ToolResultBlock(block.Id, output));
+        }
+        messages.Add(Message.UserToolResults(results));
+    }
+
+    // Return only the final text conclusion, all intermediate steps discarded
+    foreach (var b in last?.Content.OfType<TextBlock>() ?? Enumerable.Empty<TextBlock>())
+    {
+        _onLog?.Invoke("\u001b[35m[Subagent done]\u001b[0m");
+        return b.Text;
+    }
+    return $"Subagent stopped after {_maxIterations} turns without final answer.";
+}
 ```
 
 The main Agent calls it just like any other tool:
 
-```python
-TOOLS = [
-    {"name": "bash", ...},
-    {"name": "read_file", ...},
-    {"name": "write_file", ...},
-    {"name": "edit_file", ...},
-    {"name": "glob", ...},
-    {"name": "todo_write", ...},
-    # s06: new task tool
-    {"name": "task",
-     "description": "Launch a subagent to handle a complex subtask. Returns only the final conclusion.",
-     "input_schema": {"type": "object", "properties": {"description": {"type": "string"}}, "required": ["description"]}},
-]
+```csharp
+var parentTools = new ToolRegistry();
+BashTool.Register(parentTools, workDir);
+FileTools.Register(parentTools, workDir);
+var todos = new TodoTools.TodoState();
+TodoTools.Register(parentTools, todos);
 
-TOOL_HANDLERS["task"] = spawn_subagent
+// s06: new task tool
+TaskTool.Register(parentTools, SpawnSub);
 ```
 
 Three key design decisions:

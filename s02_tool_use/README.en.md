@@ -34,68 +34,61 @@ Adding a tool to the Agent requires just two things:
 
 s01 had only bash:
 
-```python
-TOOLS = [{"name": "bash", ...}]
-
-def run_bash(command): ...
+```csharp
+BashTool.Register(tools, workDir);
 ```
 
 s02 expands to 5 tools, each independently defined:
 
-```python
-TOOLS = [
-    {"name": "bash",       "description": "Run a shell command.", ...},
-    {"name": "read_file",  "description": "Read file contents.",  ...},
-    {"name": "write_file", "description": "Write content to file.", ...},
-    {"name": "edit_file",  "description": "Replace text in file once.", ...},
-    {"name": "glob",       "description": "Find files by pattern.", ...},
-]
+```csharp
+BashTool.Register(tools, workDir);
+FileTools.Register(tools, workDir);
 ```
 
 Each tool has its own implementation function:
 
-```python
-def run_read(path, limit=None):
-    lines = safe_path(path).read_text().splitlines()
-    if limit:
-        lines = lines[:limit]
-    return "\n".join(lines)
+```csharp
+static string RunRead(string path, int? limit = null)
+{
+    var lines = File.ReadAllText(PathGuard.SafePath(workDir, path)).Split('\n');
+    if (limit is int n) lines = lines.Take(n).ToArray();
+    return string.Join("\n", lines);
+}
 
-def run_write(path, content):
-    safe_path(path).write_text(content)
-    return f"Wrote {len(content)} bytes to {path}"
+static string RunWrite(string path, string content)
+{
+    File.WriteAllText(PathGuard.SafePath(workDir, path), content);
+    return $"Wrote {content.Length} bytes to {path}";
+}
 
-def run_edit(path, old_text, new_text):
-    text = safe_path(path).read_text()
-    if old_text not in text:
-        return "Error: text not found"
-    safe_path(path).write_text(text.replace(old_text, new_text, 1))
-    return f"Edited {path}"
+static string RunEdit(string path, string oldText, string newText)
+{
+    var resolved = PathGuard.SafePath(workDir, path);
+    var text = File.ReadAllText(resolved);
+    var idx = text.IndexOf(oldText, StringComparison.Ordinal);
+    if (idx < 0) return "Error: text not found";
+    File.WriteAllText(resolved, text[..idx] + newText + text[(idx + oldText.Length)..]);
+    return $"Edited {path}";
+}
 
-def run_glob(pattern):
-    import glob as g
-    return "\n".join(g.glob(pattern, root_dir=WORKDIR))
+static string RunGlob(string pattern) =>
+    string.Join("\n", PathGuard.GlobSafe(workDir, pattern));
 ```
 
 ---
 
 ## Tool Dispatch
 
-```python
-TOOL_HANDLERS = {
-    "bash":       run_bash,
-    "read_file":  run_read,
-    "write_file": run_write,
-    "edit_file":  run_edit,
-    "glob":       run_glob,
-}
+```csharp
+BashTool.Register(tools, workDir);
+FileTools.Register(tools, workDir);
 
-# Only one line changed in the loop — from hardcoded run_bash to dispatch lookup:
-for block in response.content:
-    if block.type == "tool_use":
-        handler = TOOL_HANDLERS[block.name]    # lookup
-        output = handler(**block.input)         # call
-        results.append(...)
+// Only one line changed in the loop — dispatch by name instead of hardcoded call:
+foreach (var block in response.Content.OfType<ToolUseBlock>())
+{
+    var output = tools.Invoke(block.Name, block.Input);
+    results.Add(new ToolResultBlock(block.Id, output));
+}
 ```
 
 Adding a tool = one entry in `TOOLS` array + one line in `TOOL_HANDLERS` dict. The loop stays the same.

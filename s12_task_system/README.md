@@ -48,32 +48,38 @@ TodoWrite vs Task System：
 
 每个任务是一个 JSON 文件，存于 `.tasks/` 目录：
 
-```python
-@dataclass
-class Task:
-    id: str
-    subject: str
-    description: str
-    status: str          # pending | in_progress | completed
-    owner: str | None    # Agent 名（多 Agent 场景）
-    blockedBy: list[str] # 依赖的任务 ID 列表
+```csharp
+public sealed class TaskRecord
+{
+    public string Id { get; set; } = "";
+    public string Subject { get; set; } = "";
+    public string Description { get; set; } = "";
+    public string Status { get; set; } = "pending";   // pending | in_progress | completed
+    public string? Owner { get; set; }                 // Agent name (multi-agent scenarios)
+    public List<string> BlockedBy { get; set; } = new(); // List of dependency task IDs
+}
 ```
 
 ID 用 `timestamp + random hex` 生成，简单但够用。CC 用顺序 ID + highwatermark 文件防止 ID 重用，是更严谨的设计。
 
 ### create_task: 创建任务
 
-```python
-def create_task(subject: str, description: str = "",
-                blockedBy: list[str] | None = None) -> Task:
-    task = Task(
-        id=f"task_{int(time.time())}_{random_hex(4)}",
-        subject=subject, description=description,
-        status="pending", owner=None,
-        blockedBy=blockedBy or [],
-    )
-    save_task(task)
-    return task
+```csharp
+public TaskRecord Create(string subject, string description = "",
+                         IEnumerable<string>? blockedBy = null)
+{
+    var task = new TaskRecord
+    {
+        Id = $"task_{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}_{Random.Shared.Next(0, 9999):D4}",
+        Subject = subject,
+        Description = description,
+        Status = "pending",
+        Owner = null,
+        BlockedBy = blockedBy?.ToList() ?? new(),
+    };
+    Save(task);
+    return task;
+}
 ```
 
 创建时自动 `save_task` 到 `.tasks/{id}.json`。`blockedBy` 声明依赖，比如 "写 API" 的 `blockedBy` 是 `["task_schema"]`。
@@ -82,16 +88,18 @@ def create_task(subject: str, description: str = "",
 
 一个任务只能在它的 `blockedBy` **全部 completed** 之后才能开始：
 
-```python
-def can_start(task_id: str) -> bool:
-    task = load_task(task_id)
-    for dep_id in task.blockedBy:
-        if not _task_path(dep_id).exists():
-            return False  # missing dependency = blocked
-        dep = load_task(dep_id)
-        if dep.status != "completed":
-            return False
-    return True
+```csharp
+public bool CanStart(TaskRecord task)
+{
+    foreach (var depId in task.BlockedBy)
+    {
+        var p = PathFor(depId);
+        if (!File.Exists(p)) return false;  // missing dependency = blocked
+        var dep = Load(depId);
+        if (dep.Status != "completed") return false;
+    }
+    return true;
+}
 ```
 
 `can_start` 是 `claim_task` 的前置检查：`blockedBy` 里有任何一个不是 completed，就不能认领。不存在的依赖视为 blocked，避免引用错误 ID 时崩溃。
@@ -100,19 +108,24 @@ def can_start(task_id: str) -> bool:
 
 Agent 开始做一个任务时，调用 `claim_task`：设置 `owner`，状态从 `pending` → `in_progress`。`owner` 字段记录谁在做这个任务，多 Agent 场景下防止重复认领：
 
-```python
-def claim_task(task_id: str, owner: str = "agent") -> str:
-    task = load_task(task_id)
-    if task.status != "pending":
-        return f"Task {task_id} is {task.status}, cannot claim"
-    if not can_start(task_id):
-        deps = [d for d in task.blockedBy
-                if load_task(d).status != "completed"]
-        return f"Blocked by: {deps}"
-    task.owner = owner
-    task.status = "in_progress"
-    save_task(task)
-    return f"Claimed {task_id} ({task.subject})"
+```csharp
+public (bool ok, string message) Claim(string id, string owner = "agent")
+{
+    var task = Load(id);
+    if (task.Status != "pending")
+        return (false, $"Task {id} is {task.Status}, cannot claim");
+    if (!CanStart(task))
+    {
+        var deps = task.BlockedBy
+            .Where(d => !File.Exists(PathFor(d)) || Load(d).Status != "completed")
+            .ToList();
+        return (false, $"Blocked by: [{string.Join(", ", deps)}]");
+    }
+    task.Owner = owner;
+    task.Status = "in_progress";
+    Save(task);
+    return (true, $"Claimed {task.Id} ({task.Subject})");
+}
 ```
 
 如果任务已被别人认领（`status != "pending"`），或者依赖没完成（`can_start` 返回 False），拒绝认领。
@@ -121,19 +134,20 @@ def claim_task(task_id: str, owner: str = "agent") -> str:
 
 任务做完后，设为 `completed`。同时扫描所有其他任务，找出**刚刚被解锁**的下游任务：
 
-```python
-def complete_task(task_id: str) -> str:
-    task = load_task(task_id)
-    task.status = "completed"
-    save_task(task)
-    # 找出被解锁的下游任务
-    unblocked = [t.subject for t in list_tasks()
-                 if t.status == "pending" and t.blockedBy
-                 and can_start(t.id)]
-    msg = f"Completed {task_id} ({task.subject})"
-    if unblocked:
-        msg += f"\nUnblocked: {', '.join(unblocked)}"
-    return msg
+```csharp
+public (bool ok, string message, IReadOnlyList<TaskRecord> unblocked) Complete(string id)
+{
+    var task = Load(id);
+    if (task.Status != "in_progress")
+        return (false, $"Task {id} is {task.Status}, cannot complete", Array.Empty<TaskRecord>());
+    task.Status = "completed";
+    Save(task);
+    // Find newly unblocked downstream tasks
+    var unblocked = List()
+        .Where(t => t.Status == "pending" && t.BlockedBy.Count > 0 && CanStart(t))
+        .ToList();
+    return (true, $"Completed {task.Id} ({task.Subject})", unblocked);
+}
 ```
 
 完成 "schema" 后，"endpoints" 和 "docs" 的 `can_start` 返回 True，它们可以开始。
@@ -142,10 +156,12 @@ def complete_task(task_id: str) -> str:
 
 `list_tasks` 只显示一行摘要。`get_task` 返回完整的任务 JSON，包括 description 和依赖细节。跨会话恢复时，Agent 需要读取完整描述才能继续工作：
 
-```python
-def get_task(task_id: str) -> str:
-    task = load_task(task_id)
-    return json.dumps(asdict(task), indent=2)
+```csharp
+public string Get(string id)
+{
+    var task = Load(id);
+    return JsonSerializer.Serialize(task, new JsonSerializerOptions { WriteIndented = true });
+}
 ```
 
 ### 状态机: 两个动作，三个状态
@@ -163,25 +179,25 @@ CC 没有 `in_progress → pending` 的 release 路径。如果 teammate 终止�
 
 ### 合起来跑
 
-```python
-# 创建有依赖的任务
-schema = create_task("setup database schema")
-endpoints = create_task("create API endpoints", blockedBy=[schema.id])
-tests = create_task("write tests", blockedBy=[endpoints.id])
-docs = create_task("write docs", blockedBy=[schema.id])
+```csharp
+// Create tasks with dependencies
+var schema = store.Create("setup database schema");
+var endpoints = store.Create("create API endpoints", blockedBy: [schema.Id]);
+var tests = store.Create("write tests", blockedBy: [endpoints.Id]);
+var docs = store.Create("write docs", blockedBy: [schema.Id]);
 
-# Agent 认领第一个可做的任务
-claim_task(schema.id)       # ✓ Claimed (无依赖)
-complete_task(schema.id)    # ✓ Completed → 解锁 endpoints, docs
+// Agent claims the first available task
+store.Claim(schema.Id);       // ✓ Claimed (no dependencies)
+store.Complete(schema.Id);    // ✓ Completed → unblocks endpoints, docs
 
-claim_task(endpoints.id)    # ✓ Claimed (schema 已完成)
-complete_task(endpoints.id) # ✓ Completed → 解锁 tests
+store.Claim(endpoints.Id);    // ✓ Claimed (schema completed)
+store.Complete(endpoints.Id); // ✓ Completed → unblocks tests
 
-claim_task(docs.id)         # ✓ Claimed (schema 已完成)
-complete_task(docs.id)      # ✓ Completed
+store.Claim(docs.Id);         // ✓ Claimed (schema completed)
+store.Complete(docs.Id);      // ✓ Completed
 
-claim_task(tests.id)        # ✓ Claimed (endpoints 已完成)
-complete_task(tests.id)     # ✓ Completed
+store.Claim(tests.Id);        // ✓ Claimed (endpoints completed)
+store.Complete(tests.Id);     // ✓ Completed
 ```
 
 每个 `create_task` 写一个 JSON 文件，每个 `claim_task` / `complete_task` 更新文件。跨会话时，`.tasks/` 目录还在，Agent 读文件就能恢复进度。

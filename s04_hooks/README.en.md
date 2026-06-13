@@ -16,19 +16,22 @@ The s03 Agent has permission checks. But every new check, "log every bash call",
 
 The loop quickly becomes this:
 
-```python
-def agent_loop(messages):
-    while True:
-        # ... LLM call ...
-        for block in response.content:
-            if block.type != "tool_use":
-                continue
-            log_to_file(block)          # added a line
-            check_permission(block)     # added a line
-            notify_slack(block)         # added another line
-            output = execute(block)
-            auto_git_add(block)         # yet another line
-            # ... the loop is unrecognizable
+```csharp
+async Task AgentLoop(List<Message> messages)
+{
+    while (true)
+    {
+        // ... LLM call ...
+        foreach (var block in response.Content.OfType<ToolUseBlock>())
+        {
+            LogToFile(block);
+            CheckPermission(block);
+            NotifySlack(block);
+            var output = Execute(block);
+            AutoGitAdd(block);
+        }
+    }
+}
 ```
 
 What you want to extend is the Agent's behavior, but what you're modifying is the loop itself. The loop should be a stable core; extensions should hang on the outside.
@@ -58,126 +61,134 @@ Extensions are added via `register_hook()`. The loop only calls `trigger_hooks()
 
 **Hook registry**: a dict mapping event names to callback lists.
 
-```python
-HOOKS = {
-    "UserPromptSubmit": [],
-    "PreToolUse": [],
-    "PostToolUse": [],
-    "Stop": [],
-}
+```csharp
+var hooks = new HookBus();
 
-def register_hook(event: str, callback):
-    HOOKS[event].append(callback)
-
-def trigger_hooks(event: str, *args):
-    for callback in HOOKS[event]:
-        result = callback(*args)
-        if result is not None:   # return value ≠ None → hook says "stop"
-            return result
-    return None
+hooks.OnUserPromptSubmit(query => { });
+hooks.OnPreToolUse(block => null);   // non-null return blocks the tool
+hooks.OnPostToolUse((block, output) => { });
+hooks.OnStop(() => null);   // non-null return forces continuation
 ```
 
 In the teaching version, PreToolUse returning non-None means block execution; Stop returning non-None means force continuation. UserPromptSubmit and PostToolUse return values are unused.
 
 **UserPromptSubmit**, triggers after user input, before entering the LLM. CC can intercept or modify input; the teaching version only logs:
 
-```python
-def context_inject_hook(query: str) -> str | None:
-    """Inject current working directory info into every prompt."""
-    print(f"\033[90m[HOOK] UserPromptSubmit: working in {WORKDIR}\033[0m")
-    return None   # return None = no modification, let prompt through
+```csharp
+void ContextInjectHook(string query)
+{
+    Console.WriteLine($"\u001b[90m[HOOK] UserPromptSubmit: working in {workDir}\u001b[0m");
+}
 
-register_hook("UserPromptSubmit", context_inject_hook)
+agent.Hooks.OnUserPromptSubmit(ContextInjectHook);
 ```
 
 In the main loop, triggered right after user input:
 
-```python
-query = input("s04 >> ")
-trigger_hooks("UserPromptSubmit", query)   # ← before entering LLM
-history.append({"role": "user", "content": query})
-agent_loop(history)
+```csharp
+var query = Console.ReadLine() ?? "";
+agent.FireUserPromptSubmit(query);    // ← before entering LLM
+history.Add(Message.UserText(query));
+await agent.RunUntilDoneAsync(history);
 ```
 
 **PreToolUse / PostToolUse**, hooks before and after tool execution. s03's permission check logic is now wrapped as a PreToolUse hook, plus a logging hook and a large-output reminder:
 
-```python
-# PreToolUse: permission check (s03 logic, moved from loop to hook)
-def permission_hook(block):
-    if block.name == "bash":
-        for pattern in DENY_LIST:
-            if pattern in block.input.get("command", ""):
-                return "Permission denied by deny list"
-    if block.name in ("write_file", "edit_file"):
-        path = block.input.get("path", "")
-        if not (WORKDIR / path).resolve().is_relative_to(WORKDIR):
-            choice = input("   Allow? [y/N] ").strip().lower()
-            if choice not in ("y", "yes"):
-                return "Permission denied by user"
-    return None
+```csharp
+// PreToolUse: permission check (s03 logic, moved from loop to hook)
+string? PermissionHook(ToolUseBlock block)
+{
+    if (block.Name == "bash")
+    {
+        var cmd = block.Input.TryGetProperty("command", out var c) ? c.GetString() ?? "" : "";
+        foreach (var pattern in denyList)
+        {
+            if (cmd.Contains(pattern, StringComparison.Ordinal))
+                return "Permission denied by deny list";
+        }
+    }
+    if (block.Name is "write_file" or "edit_file"
+        && block.Input.TryGetProperty("path", out var p) && p.ValueKind == JsonValueKind.String)
+    {
+        try { _ = PathGuard.SafePath(workDir, p.GetString() ?? ""); }
+        catch
+        {
+            Console.Write("   Allow? [y/N] ");
+            var choice = (Console.ReadLine() ?? "").Trim().ToLowerInvariant();
+            if (choice is not ("y" or "yes")) return "Permission denied by user";
+        }
+    }
+    return null;
+}
 
-# PreToolUse: logging
-def log_hook(block):
-    print(f"[HOOK] {block.name}(...)")
+// PreToolUse: logging
+void LogHook(ToolUseBlock block)
+{
+    Console.WriteLine($"[HOOK] {block.Name}(...)");
+}
 
-# PostToolUse: large output reminder
-def large_output_hook(block, output):
-    if len(str(output)) > 100000:
-        print(f"[HOOK] ⚠ Large output from {block.name}")
+// PostToolUse: large output reminder
+void LargeOutputHook(ToolUseBlock block, string output)
+{
+    if (output.Length > 100_000)
+        Console.WriteLine($"[HOOK] ⚠ Large output from {block.Name}");
+}
 
-register_hook("PreToolUse", permission_hook)
-register_hook("PreToolUse", log_hook)
-register_hook("PostToolUse", large_output_hook)
+agent.Hooks.OnPreToolUse(PermissionHook);
+agent.Hooks.OnPreToolUse(LogHook);
+agent.Hooks.OnPostToolUse(LargeOutputHook);
 ```
 
 **Stop**, triggers when the loop is about to exit (`stop_reason != "tool_use"`). The teaching version prints a cleanup summary:
 
-```python
-def summary_hook(messages: list) -> str | None:
-    """Print a summary when the loop is about to stop."""
-    tool_count = sum(1 for m in messages
-                     for b in (m.get("content") if isinstance(m.get("content"), list) else [])
-                     if isinstance(b, dict) and b.get("type") == "tool_result")
-    print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
-    return None   # return None = allow stop, return string = force continuation
+```csharp
+string? SummaryHook(IReadOnlyList<Message>? messages)
+{
+    var toolCount = messages?
+        .SelectMany(m => m.Content)
+        .OfType<ToolResultBlock>()
+        .Count() ?? 0;
+    Console.WriteLine($"\u001b[90m[HOOK] Stop: session used {toolCount} tool calls\u001b[0m");
+    return null;   // return null = allow stop, return string = force continuation
+}
 
-register_hook("Stop", summary_hook)
+agent.Hooks.OnStop(SummaryHook);
 ```
 
 In agent_loop, triggered before exit:
 
-```python
-if response.stop_reason != "tool_use":
-    force = trigger_hooks("Stop", messages)   # ← before exiting
-    if force:
-        # hook returned a message → inject it and continue
-        messages.append({"role": "user", "content": force})
-        continue
-    return
+```csharp
+if (response.StopReason != "tool_use")
+{
+    var force = agent.Hooks.FireStopOnHistory(messages);   // ← before exiting
+    if (force is not null)
+    {
+        // hook returned a message → inject it and continue
+        messages.Add(Message.UserText(force));
+        continue;
+    }
+    return;
+}
 ```
 
 **Only one change in the loop**: s03 directly called `check_permission(block)`, s04 replaces it with `trigger_hooks("PreToolUse", block)`:
 
-```python
-for block in response.content:
-    if block.type != "tool_use":
-        continue
+```csharp
+foreach (var block in response.Content.OfType<ToolUseBlock>())
+{
+    // s03: if (!CheckPermission(block)) { ... }
+    // s04: hooks replace hardcoding
+    var blocked = agent.Hooks.FirePreToolUse(block);
+    if (blocked is not null)
+    {
+        results.Add(new ToolResultBlock(block.Id, blocked));
+        continue;
+    }
 
-    # s03: if not check_permission(block): ...
-    # s04: hooks replace hardcoding
-    blocked = trigger_hooks("PreToolUse", block)
-    if blocked:
-        results.append({"type": "tool_result", "tool_use_id": block.id,
-                        "content": str(blocked)})
-        continue
-
-    handler = TOOL_HANDLERS.get(block.name)
-    output = handler(**block.input) if handler else f"Unknown: {block.name}"
-
-    trigger_hooks("PostToolUse", block, output)
-
-    results.append({"type": "tool_result", "tool_use_id": block.id,
-                    "content": output})
+    var output = tools.Invoke(block.Name, block.Input);
+    agent.Hooks.FirePostToolUse(block, output);
+    results.Add(new ToolResultBlock(block.Id, output));
+}
 ```
 
 Four hooks cover the critical nodes of the agent cycle: input → before execution → after execution → exit. The loop only calls trigger_hooks(); all logic lives in hook callbacks.

@@ -13,21 +13,20 @@ s01 → ... → s08 → s09 → `s10` → [s11](../s11_error_recovery/) → s12 
 
 From s01 to s09, the system prompt was always one hardcoded line:
 
-```python
-SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks."
+```csharp
+var SYSTEM = $"You are a coding agent at {workDir}. Use tools to solve tasks.";
 ```
 
 That worked for s01 — only bash, read, write. But by s09, the agent has memory, compression, skill loading. The prompt needs to describe more and more capabilities:
 
-```python
-SYSTEM = (
-    f"You are a coding agent at {WORKDIR}. "
-    "Use tools to solve tasks. Act, don't explain. "
-    "Before starting any multi-step task, use todo_write. "
-    "Skills are available via list_skills and load_skill. "
-    "Relevant memories are injected below when available. "
-    # ... add a capability, add a line
-)
+```csharp
+var SYSTEM =
+    $"You are a coding agent at {workDir}. "
+    + "Use tools to solve tasks. Act, don't explain. "
+    + "Before starting any multi-step task, use todo_write. "
+    + "Skills are available via list_skills and load_skill. "
+    + "Relevant memories are injected below when available. ";
+// ... add a capability, add a line
 ```
 
 Three problems:
@@ -65,13 +64,14 @@ Key design: whether a section loads depends on real state (tools exist, files ex
 
 Split the monolithic string into a dictionary, each key is a topic:
 
-```python
-PROMPT_SECTIONS = {
-    "identity": "You are a coding agent. Act, don't explain.",
-    "tools": "Available tools: bash, read_file, write_file.",
-    "workspace": f"Working directory: {WORKDIR}",
-    "memory": "Relevant memories are injected below when available.",
-}
+```csharp
+var sections = new Dictionary<string, string>
+{
+    ["identity"] = "You are a coding agent. Act, don't explain.",
+    ["tools"] = "Available tools: bash, read_file, write_file, edit_file, glob.",
+    ["workspace"] = $"Working directory: {workDir}",
+    ["memory"] = "Relevant memories are injected below when available.",
+};
 ```
 
 Each section is maintained independently. Changing `tools` doesn't affect `identity`; adding `memory` doesn't touch `workspace`.
@@ -80,21 +80,16 @@ Each section is maintained independently. Changing `tools` doesn't affect `ident
 
 Not every section is needed every turn. No memory files? Loading the memory section just wastes tokens. Assembly is based on real state in context:
 
-```python
-def assemble_system_prompt(context: dict) -> str:
-    sections = []
-
-    # Always loaded
-    sections.append(PROMPT_SECTIONS["identity"])
-    sections.append(PROMPT_SECTIONS["tools"])
-    sections.append(PROMPT_SECTIONS["workspace"])
-
-    # On-demand — based on real state, not keywords
-    memories = context.get("memories", "")
-    if memories:
-        sections.append(f"Relevant memories:\n{memories}")
-
-    return "\n\n".join(sections)
+```csharp
+var assemble = (Dictionary<string, object> ctx) =>
+{
+    var parts = new List<string> { sections["identity"], sections["tools"], sections["workspace"] };
+    if (ctx.TryGetValue("memories", out var m) && m is string ms && !string.IsNullOrEmpty(ms))
+    {
+        parts.Add($"Relevant memories:\n{ms}");
+    }
+    return string.Join("\n\n", parts);
+};
 ```
 
 "Always loaded" sections are needed every turn: identity, tools, workspace. "On-demand" sections are only useful under specific conditions.
@@ -105,15 +100,30 @@ Why not load everything? Tokens have cost (system prompt is billed every turn), 
 
 When context hasn't changed (multiple LLM calls in the same turn with the same context), re-assembling is wasteful. Use deterministic serialization to detect changes and return cached result:
 
-```python
-def get_system_prompt(context: dict) -> str:
-    global _last_context_key, _last_prompt
-    key = json.dumps(context, sort_keys=True, ensure_ascii=False, default=str)
-    if key == _last_context_key and _last_prompt:
-        return _last_prompt
-    _last_context_key = key
-    _last_prompt = assemble_system_prompt(context)
-    return _last_prompt
+```csharp
+string? lastKey = null;
+string? lastPrompt = null;
+var getPrompt = (Dictionary<string, object> ctx) =>
+{
+    var key = JsonSerializer.Serialize(ctx, new JsonSerializerOptions
+    {
+        WriteIndented = false,
+    });
+    if (key == lastKey && lastPrompt is not null)
+    {
+        Console.WriteLine("  \u001b[90m[cache hit] system prompt unchanged\u001b[0m");
+        return lastPrompt;
+    }
+    lastKey = key;
+    lastPrompt = assemble(ctx);
+    var loaded = new List<string> { "identity", "tools", "workspace" };
+    if (ctx.TryGetValue("memories", out var m) && m is string ms && !string.IsNullOrEmpty(ms))
+    {
+        loaded.Add("memory");
+    }
+    Console.WriteLine($"  \u001b[32m[assembled] sections: {string.Join(", ", loaded)}\u001b[0m");
+    return lastPrompt;
+};
 ```
 
 `json.dumps` instead of `hash()`: Python's built-in `hash()` has process randomization (unsuitable for stable cache keys) and throws `unhashable type` on nested dicts/lists.
@@ -124,34 +134,35 @@ Note: this cache only avoids redundant string assembly within a process. It's no
 
 Context reflects the actual runtime state:
 
-```python
-def update_context(context: dict, messages: list) -> dict:
-    memories = ""
-    if MEMORY_INDEX.exists():
-        content = MEMORY_INDEX.read_text().strip()
-        if content:
-            memories = content
-    return {
-        "enabled_tools": list(TOOL_HANDLERS.keys()),
-        "workspace": str(WORKDIR),
-        "memories": memories,
-    }
+```csharp
+var updateContext = () =>
+{
+    var memIndex = File.Exists(indexPath) ? File.ReadAllText(indexPath).Trim() : "";
+    return new Dictionary<string, object>
+    {
+        ["enabled_tools"] = tools.All().Select(t => t.Name).ToList(),
+        ["workspace"] = workDir,
+        ["memories"] = memIndex,
+    };
+};
 ```
 
 `enabled_tools` lists actually registered tools. `memories` checks whether `.memory/MEMORY.md` exists. Section loading is based on this real state, not searching for keywords in messages.
 
 ### Putting It Together
 
-```python
-def agent_loop(messages: list, context: dict):
-    system = get_system_prompt(context)
-    while True:
-        response = client.messages.create(
-            model=MODEL, system=system, messages=messages,
-            tools=TOOLS, max_tokens=8000)
-        # ... tool execution ...
-        context = update_context(context, messages)
-        system = get_system_prompt(context)
+```csharp
+var ctx = updateContext();
+var agent = new AgentHarness(client, tools, () => getPrompt(ctx))
+{
+    OnLog = Console.WriteLine,
+    Permissions = new AllowAllPermissions(),
+};
+agent.Hooks.OnPreToolUse(block =>
+{
+    ctx = updateContext();
+    return null;
+});
 ```
 
 At the start of each loop iteration, get the system prompt. If context changed, re-assemble; if not, return cached version.

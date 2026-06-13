@@ -40,71 +40,69 @@ Let's translate this process into code. Step by step:
 
 **Step 1**: Start with the user's question as the first message.
 
-```python
-messages = [{"role": "user", "content": query}]
+```csharp
+var messages = new List<Message> { Message.UserText(query) };
 ```
 
 **Step 2**: Send the messages and tool definitions to the LLM.
 
-```python
-response = client.messages.create(
-    model=MODEL, system=SYSTEM, messages=messages,
-    tools=TOOLS, max_tokens=8000,
-)
+```csharp
+var response = await client.CreateMessageAsync(
+    systemPrompt: SYSTEM, messages: messages, tools: toolSpecs, maxTokensOverride: 8000);
 ```
 
 **Step 3**: Append the model's response and check whether it called a tool. No tool call → done.
 
-```python
-messages.append({"role": "assistant", "content": response.content})
-if response.stop_reason != "tool_use":
-    return
+```csharp
+messages.Add(Message.Assistant(response.Content));
+if (response.StopReason != "tool_use") return;
 ```
 
 **Step 4**: Execute the tool the model requested and collect the results.
 
-```python
-results = []
-for block in response.content:
-    if block.type == "tool_use":
-        output = run_bash(block.input["command"])
-        results.append({
-            "type": "tool_result",
-            "tool_use_id": block.id,
-            "content": output,
-        })
+```csharp
+var results = new List<ToolResultBlock>();
+foreach (var block in response.Content.OfType<ToolUseBlock>())
+{
+    var cmd = block.Input.GetProperty("command").GetString()!;
+    var r = BashRunner.Run(cmd, workDir);
+    var output = (r.StdOut + r.StdErr).Trim();
+    if (output.Length == 0) output = "(no output)";
+    results.Add(new ToolResultBlock(block.Id, output));
+}
 ```
 
 **Step 5**: Append the tool results as a new message and go back to Step 2.
 
-```python
-messages.append({"role": "user", "content": results})
+```csharp
+messages.Add(Message.UserToolResults(results));
 ```
 
 Assembled into a complete function:
 
-```python
-def agent_loop(messages):
-    while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
-        )
-        messages.append({"role": "assistant", "content": response.content})
+```csharp
+async Task AgentLoop(List<Message> messages)
+{
+    while (true)
+    {
+        var response = await client.CreateMessageAsync(
+            systemPrompt: SYSTEM, messages: messages, tools: toolSpecs, maxTokensOverride: 8000);
+        messages.Add(Message.Assistant(response.Content));
 
-        if response.stop_reason != "tool_use":
-            return
+        if (response.StopReason != "tool_use") return;
 
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                output = run_bash(block.input["command"])
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": output,
-                })
-        messages.append({"role": "user", "content": results})
+        var results = new List<ToolResultBlock>();
+        foreach (var block in response.Content.OfType<ToolUseBlock>())
+        {
+            var cmd = block.Input.GetProperty("command").GetString()!;
+            var r = BashRunner.Run(cmd, workDir);
+            var output = (r.StdOut + r.StdErr).Trim();
+            if (output.Length == 0) output = "(no output)";
+            results.Add(new ToolResultBlock(block.Id, output));
+        }
+        messages.Add(Message.UserToolResults(results));
+    }
+}
 ```
 
 Under 30 lines — that's the minimal runnable agent harness kernel. It's not intelligence itself, but the smallest runtime framework that lets the model keep acting. The model decides (whether to call a tool, which one), the harness executes (if called, run it, feed the result back). The next 18 chapters all add mechanisms on top of this loop. The loop itself never changes.

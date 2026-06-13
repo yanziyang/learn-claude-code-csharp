@@ -51,14 +51,15 @@ The teaching version implements a minimal queue processor: `agent_lock` tells wh
 
 Each cron task is a `CronJob` object:
 
-```python
-@dataclass
-class CronJob:
-    id: str
-    cron: str        # "0 9 * * *" (5-field cron expression)
-    prompt: str      # Message injected to the agent when fired
-    recurring: bool  # True=recurring, False=one-shot
-    durable: bool    # True=write to disk, survives sessions
+```csharp
+public sealed class CronJob
+{
+    public string Id { get; set; } = "";
+    public string Cron { get; set; } = "";       // "0 9 * * *" (5-field cron expression)
+    public string Prompt { get; set; } = "";     // Message injected to the agent when fired
+    public bool Recurring { get; set; } = true;  // True=recurring, False=one-shot
+    public bool Durable { get; set; } = true;    // True=write to disk, survives sessions
+}
 ```
 
 Cron expression, 5 fields, used by Unix for 50 years:
@@ -77,57 +78,67 @@ Supports `*`, `*/N`, `N`, `N-M`, `N,M,...`.
 
 Standard cron semantics: minute, hour, month must all match; day-of-month (DOM) and day-of-week (DOW) use OR when both are constrained:
 
-```python
-def cron_matches(cron_expr: str, dt: datetime) -> bool:
-    fields = cron_expr.strip().split()
-    if len(fields) != 5:
-        return False
-    minute, hour, dom, month, dow = fields
-    dow_val = (dt.weekday() + 1) % 7  # Python Monday=0 → cron Sunday=0
+```csharp
+public static bool CronMatches(string cronExpr, DateTime dt)
+{
+    var fields = cronExpr.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+    if (fields.Length != 5) return false;
+    var minute = fields[0];
+    var hour = fields[1];
+    var dom = fields[2];
+    var month = fields[3];
+    var dow = fields[4];
+    var dowVal = (dt.DayOfWeek == DayOfWeek.Sunday) ? 0 : (int)dt.DayOfWeek;
 
-    m = _cron_field_matches(minute, dt.minute)
-    h = _cron_field_matches(hour, dt.hour)
-    dom_ok = _cron_field_matches(dom, dt.day)
-    month_ok = _cron_field_matches(month, dt.month)
-    dow_ok = _cron_field_matches(dow, dow_val)
+    if (!FieldMatches(minute, dt.Minute, 0, 59)) return false;
+    if (!FieldMatches(hour, dt.Hour, 0, 23)) return false;
+    if (!FieldMatches(month, dt.Month, 1, 12)) return false;
+    var domOk = FieldMatches(dom, dt.Day, 1, 31);
+    var dowOk = FieldMatches(dow, dowVal, 0, 6);
 
-    if not (m and h and month_ok):
-        return False
-    # DOM and DOW: both constrained → either matching is enough (OR)
-    dom_unconstrained = dom == "*"
-    dow_unconstrained = dow == "*"
-    if dom_unconstrained and dow_unconstrained:
-        return True
-    if dom_unconstrained:
-        return dow_ok
-    if dow_unconstrained:
-        return dom_ok
-    return dom_ok or dow_ok
+    // DOM and DOW: both constrained → either matching is enough (OR)
+    var domFree = dom == "*";
+    var dowFree = dow == "*";
+    if (domFree && dowFree) return true;
+    if (domFree) return dowOk;
+    if (dowFree) return domOk;
+    return domOk || dowOk;
+}
 ```
 
 ### Independent Scheduler Thread: 1-Second Polling
 
 The scheduler runs in an independent daemon thread, not dependent on whether agent_loop is executing. Individual job errors don't kill the entire thread:
 
-```python
-def cron_scheduler_loop():
-    while True:
-        time.sleep(1)
-        now = datetime.now()
-        minute_marker = now.strftime("%Y-%m-%d %H:%M")
-        with cron_lock:
-            for job in list(scheduled_jobs.values()):
-                try:
-                    if cron_matches(job.cron, now):
-                        if _last_fired.get(job.id) != minute_marker:
-                            cron_queue.append(job)
-                            _last_fired[job.id] = minute_marker
-                        if not job.recurring:
-                            scheduled_jobs.pop(job.id, None)
-                            if job.durable:
-                                save_durable_jobs()
-                except Exception as e:
-                    print(f"[cron error] {job.id}: {e}")
+```csharp
+void Loop()
+{
+    while (!_cts.IsCancellationRequested)
+    {
+        Thread.Sleep(1000);
+        var now = DateTime.Now;
+        var marker = now.ToString("yyyy-MM-dd HH:mm");
+        foreach (var job in _jobs.Values.ToList())
+        {
+            try
+            {
+                if (!CronMatches(job.Cron, now)) continue;
+                if (_lastFired.TryGetValue(job.Id, out var prev) && prev == marker) continue;
+                _queue.Enqueue(job);
+                _lastFired[job.Id] = marker;
+                if (!job.Recurring)
+                {
+                    _jobs.TryRemove(job.Id, out _);
+                    SaveDurable();
+                }
+            }
+            catch (Exception ex)
+            {
+                OnLog?.Invoke($"[cron error] {job.Id}: {ex.Message}");
+            }
+        }
+    }
+}
 ```
 
 Key design:
@@ -140,28 +151,32 @@ Key design:
 
 The queue processor does not check time. It only starts a turn when queued work exists and the agent is idle:
 
-```python
-def queue_processor_loop():
-    while True:
-        time.sleep(0.2)
-        if not has_cron_queue():
-            continue
-        if not agent_lock.acquire(blocking=False):
-            continue
-        try:
-            if has_cron_queue():
-                run_agent_turn_locked()
-        finally:
-            agent_lock.release()
+```csharp
+void QueueProcessorLoop()
+{
+    while (true)
+    {
+        Thread.Sleep(200);
+        if (!HasCronQueue()) continue;
+        if (!agentLock.WaitOne(0)) continue;
+        try
+        {
+            if (HasCronQueue()) RunAgentTurnLocked();
+        }
+        finally
+        {
+            agentLock.Release();
+        }
+    }
+}
 ```
 
 agent_loop also doesn't check time. It only takes fired tasks from `cron_queue` and injects them into messages:
 
-```python
-fired = consume_cron_queue()
-for job in fired:
-    messages.append({"role": "user",
-                     "content": f"[Scheduled] {job.prompt}"})
+```csharp
+var fired = cron.DrainQueue();
+foreach (var j in fired)
+    messages.Add(Message.UserText($"<cron-fire id=\"{j.Id}\">{j.Prompt}</cron-fire>"));
 ```
 
 Producer (scheduler thread), deliverer (queue processor), and consumer (agent_loop) are decoupled via `cron_queue`, `cron_lock`, and `agent_lock`.
@@ -170,12 +185,13 @@ Producer (scheduler thread), deliverer (queue processor), and consumer (agent_lo
 
 `schedule_job` validates the cron expression before registering, returning an error for invalid input:
 
-```python
-def schedule_job(cron, prompt, recurring=True, durable=True):
-    err = validate_cron(cron)
-    if err:
-        return err
-    # ... register job
+```csharp
+public string Schedule(string cron, string prompt, bool recurring = true, bool durable = true)
+{
+    var err = ValidateCron(cron);
+    if (err is not null) return $"Error: {err}";
+    // ... register job
+}
 ```
 
 Loading durable jobs from disk also skips invalid expressions, preventing a single bad task from breaking startup.

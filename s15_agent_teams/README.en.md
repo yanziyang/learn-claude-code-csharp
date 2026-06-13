@@ -42,24 +42,44 @@ Sub-agent vs Teammate:
 
 Each agent (including Lead and teammates) has a `.jsonl` inbox. Send = append a JSON line to the target's file. Read = read file + delete (consumption):
 
-```python
-class MessageBus:
-    def send(self, from_agent: str, to_agent: str,
-             content: str, msg_type: str = "message"):
-        msg = {"from": from_agent, "to": to_agent,
-               "content": content, "type": msg_type,
-               "ts": time.time()}
-        inbox = MAILBOX_DIR / f"{to_agent}.jsonl"
-        with open(inbox, "a") as f:
-            f.write(json.dumps(msg) + "\n")
+```csharp
+public sealed class MessageBus
+{
+    private readonly string _mailboxDir;
+    private readonly object _lock = new();
 
-    def read_inbox(self, agent: str) -> list[dict]:
-        inbox = MAILBOX_DIR / f"{agent}.jsonl"
-        if not inbox.exists():
-            return []
-        msgs = [json.loads(line) for line in inbox.read_text().splitlines()]
-        inbox.unlink()  # consume: read + delete
-        return msgs
+    public void Send(string from, string to, string content, string msgType = "message")
+    {
+        var msg = new MailboxMessage
+        {
+            From = from,
+            To = to,
+            Content = content,
+            Type = msgType,
+            Ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0,
+        };
+        var inbox = Path.Combine(_mailboxDir, $"{to}.jsonl");
+        lock (_lock)
+        {
+            File.AppendAllText(inbox, JsonSerializer.Serialize(msg) + "\n");
+        }
+    }
+
+    public List<MailboxMessage> ReadInbox(string agent)
+    {
+        var inbox = Path.Combine(_mailboxDir, $"{agent}.jsonl");
+        if (!File.Exists(inbox)) return new List<MailboxMessage>();
+        lock (_lock)
+        {
+            var msgs = File.ReadAllText(inbox)
+                .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                .Select(l => JsonSerializer.Deserialize<MailboxMessage>(l)!)
+                .ToList();
+            File.Delete(inbox);  // consume: read + delete
+            return msgs;
+        }
+    }
+}
 ```
 
 Why files instead of in-memory queues? Teaching code uses files because they're intuitive and observable across threads. Real CC also uses file inboxes (`~/.claude/teams/{team}/inboxes/`) but adds `proper-lockfile` for concurrent write safety. The teaching version's `read_inbox` has a read + unlink race, concurrent reads could lose messages, acceptable for teaching purposes.
@@ -68,26 +88,35 @@ Why files instead of in-memory queues? Teaching code uses files because they're 
 
 Lead calls the `spawn_teammate` tool to start a teammate. The teammate runs in its own daemon thread with its own system prompt, messages, and simplified tool set:
 
-```python
-def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
-    system = f"You are '{name}', a {role}. Use tools to complete tasks."
+```csharp
+string SpawnTeammateThread(string name, string role, string prompt)
+{
+    var system = $"You are '{name}', a {role}. Use tools to complete tasks.";
+    var messages = new List<Message> { Message.UserText(prompt) };
+    var subTools = new ToolRegistry();
+    BashTool.Register(subTools, _workDir);
+    FileTools.Register(subTools, _workDir);
 
-    def run():
-        messages = [{"role": "user", "content": prompt}]
-        sub_tools = [bash, read_file, write_file, send_message]
-        for _ in range(10):           # max 10 rounds
-            inbox = BUS.read_inbox(name)
-            if inbox:
-                messages.append({"role": "user",
-                    "content": f"<inbox>{json.dumps(inbox)}</inbox>"})
-            response = client.messages.create(
-                model=MODEL, system=system, messages=messages[-20:],
-                tools=sub_tools, max_tokens=8000)
-            # ... execute tools, process results
-        # Send final summary to Lead
-        BUS.send(name, "lead", summary, "result")
+    new Thread(async () =>
+    {
+        for (var i = 0; i < 10; i++)           // max 10 rounds
+        {
+            var inbox = _bus.ReadInbox(name);
+            if (inbox.Count > 0)
+            {
+                var json = JsonSerializer.Serialize(inbox);
+                messages.Add(Message.UserText($"<inbox>{json}</inbox>"));
+            }
+            var response = await _client.CreateMessageAsync(
+                system, messages, subTools.AllSpecs().ToList(), maxTokens: 8000);
+            // ... execute tools, process results
+        }
+        // Send final summary to Lead
+        _bus.Send(name, "lead", summary, "result");
+    }) { IsBackground = true }.Start();
 
-    threading.Thread(target=run, daemon=True).start()
+    return $"Spawned teammate '{name}' (role: {role})";
+}
 ```
 
 Key design:
@@ -99,14 +128,15 @@ Key design:
 
 Lead checks inbox after each main loop iteration. Teammate messages are injected into history so the LLM can see and react to them:
 
-```python
-# After main loop iteration
-inbox = BUS.read_inbox("lead")
-if inbox:
-    inbox_text = "\n".join(
-        f"From {m['from']}: {m['content'][:200]}" for m in inbox)
-    history.append({"role": "user",
-                    "content": f"[Inbox]\n{inbox_text}"})
+```csharp
+// After main loop iteration
+var inbox = bus.ReadInbox("lead");
+if (inbox.Count > 0)
+{
+    messages.Add(Message.UserText("<inbox>\n" +
+        JsonSerializer.Serialize(inbox, new JsonSerializerOptions { WriteIndented = true }) +
+        "\n</inbox>"));
+}
 ```
 
 Teaching code injects in the user input loop. Real CC is more refined, Lead's `useInboxPoller` checks every 1 second, submitting messages as new turns without waiting for user input.

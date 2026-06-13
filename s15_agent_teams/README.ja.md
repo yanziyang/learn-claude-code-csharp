@@ -42,24 +42,44 @@ s06 のサブ Agent は臨時スタッフ、一つの仕事を終えたら去る
 
 各 Agent（Lead とチームメイトを含む）には `.jsonl` 受信箱がある。メッセージ送信 = 相手のファイルに 1 行 JSON を append。メッセージ読み取り = ファイル読み込み + 削除（消費式）：
 
-```python
-class MessageBus:
-    def send(self, from_agent: str, to_agent: str,
-             content: str, msg_type: str = "message"):
-        msg = {"from": from_agent, "to": to_agent,
-               "content": content, "type": msg_type,
-               "ts": time.time()}
-        inbox = MAILBOX_DIR / f"{to_agent}.jsonl"
-        with open(inbox, "a") as f:
-            f.write(json.dumps(msg) + "\n")
+```csharp
+public sealed class MessageBus
+{
+    private readonly string _mailboxDir;
+    private readonly object _lock = new();
 
-    def read_inbox(self, agent: str) -> list[dict]:
-        inbox = MAILBOX_DIR / f"{agent}.jsonl"
-        if not inbox.exists():
-            return []
-        msgs = [json.loads(line) for line in inbox.read_text().splitlines()]
-        inbox.unlink()  # 消費式：読んだら削除
-        return msgs
+    public void Send(string from, string to, string content, string msgType = "message")
+    {
+        var msg = new MailboxMessage
+        {
+            From = from,
+            To = to,
+            Content = content,
+            Type = msgType,
+            Ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0,
+        };
+        var inbox = Path.Combine(_mailboxDir, $"{to}.jsonl");
+        lock (_lock)
+        {
+            File.AppendAllText(inbox, JsonSerializer.Serialize(msg) + "\n");
+        }
+    }
+
+    public List<MailboxMessage> ReadInbox(string agent)
+    {
+        var inbox = Path.Combine(_mailboxDir, $"{agent}.jsonl");
+        if (!File.Exists(inbox)) return new List<MailboxMessage>();
+        lock (_lock)
+        {
+            var msgs = File.ReadAllText(inbox)
+                .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                .Select(l => JsonSerializer.Deserialize<MailboxMessage>(l)!)
+                .ToList();
+            File.Delete(inbox);  // consume: read + delete
+            return msgs;
+        }
+    }
+}
 ```
 
 なぜファイルか、メモリキューではなく？教学版がファイルを選ぶ理由は、直感的でスレッドをまたいで観察可能だから。真实 CC もファイル受信箱（`~/.claude/teams/{team}/inboxes/`）を使うが、`proper-lockfile` で並行書き込みの安全性を確保。教学版の `read_inbox` には read + unlink の競合状態があり、マルチスレッド同時読みでメッセージを損失する可能性があるが、教学目的には許容範囲。
@@ -68,26 +88,35 @@ class MessageBus:
 
 Lead が `spawn_teammate` ツールを呼び出してチームメイトを起動。チームメイトは独自の daemon スレッドで動作、独自の system prompt、messages、簡易ツールセットを持つ：
 
-```python
-def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
-    system = f"You are '{name}', a {role}. Use tools to complete tasks."
+```csharp
+string SpawnTeammateThread(string name, string role, string prompt)
+{
+    var system = $"You are '{name}', a {role}. Use tools to complete tasks.";
+    var messages = new List<Message> { Message.UserText(prompt) };
+    var subTools = new ToolRegistry();
+    BashTool.Register(subTools, _workDir);
+    FileTools.Register(subTools, _workDir);
 
-    def run():
-        messages = [{"role": "user", "content": prompt}]
-        sub_tools = [bash, read_file, write_file, send_message]
-        for _ in range(10):           # 最大 10 ラウンド
-            inbox = BUS.read_inbox(name)
-            if inbox:
-                messages.append({"role": "user",
-                    "content": f"<inbox>{json.dumps(inbox)}</inbox>"})
-            response = client.messages.create(
-                model=MODEL, system=system, messages=messages[-20:],
-                tools=sub_tools, max_tokens=8000)
-            # ... ツール実行、結果処理
-        # 完了後 summary を Lead に送信
-        BUS.send(name, "lead", summary, "result")
+    new Thread(async () =>
+    {
+        for (var i = 0; i < 10; i++)           // max 10 rounds
+        {
+            var inbox = _bus.ReadInbox(name);
+            if (inbox.Count > 0)
+            {
+                var json = JsonSerializer.Serialize(inbox);
+                messages.Add(Message.UserText($"<inbox>{json}</inbox>"));
+            }
+            var response = await _client.CreateMessageAsync(
+                system, messages, subTools.AllSpecs().ToList(), maxTokens: 8000);
+            // ... execute tools, process results
+        }
+        // Send final summary to Lead
+        _bus.Send(name, "lead", summary, "result");
+    }) { IsBackground = true }.Start();
 
-    threading.Thread(target=run, daemon=True).start()
+    return $"Spawned teammate '{name}' (role: {role})";
+}
 ```
 
 重要な設計：
@@ -99,14 +128,15 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
 
 Lead はメインループの各反復後に受信箱を確認。チームメイトからのメッセージを history に注入し、LLM が確認して反応できるようにする：
 
-```python
-# メインループ反復後
-inbox = BUS.read_inbox("lead")
-if inbox:
-    inbox_text = "\n".join(
-        f"From {m['from']}: {m['content'][:200]}" for m in inbox)
-    history.append({"role": "user",
-                    "content": f"[Inbox]\n{inbox_text}"})
+```csharp
+// After main loop iteration
+var inbox = bus.ReadInbox("lead");
+if (inbox.Count > 0)
+{
+    messages.Add(Message.UserText("<inbox>\n" +
+        JsonSerializer.Serialize(inbox, new JsonSerializerOptions { WriteIndented = true }) +
+        "\n</inbox>"));
+}
 ```
 
 教学版はユーザー入力ループ内で注入。真实 CC はより精密、Lead の `useInboxPoller` が毎秒チェックし、ユーザー入力を待たずにメッセージを新しい turn として送信。

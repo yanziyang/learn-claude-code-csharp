@@ -64,14 +64,17 @@ User prefers using tabs, not spaces, for indentation.
 
 新しい記憶を書き込むとインデックスを自動再構築：
 
-```python
-def write_memory_file(name, mem_type, description, body):
-    slug = name.lower().replace(" ", "-")
-    filepath = MEMORY_DIR / f"{slug}.md"
-    filepath.write_text(
-        f"---\nname: {name}\ndescription: {description}\ntype: {mem_type}\n---\n\n{body}\n"
-    )
-    _rebuild_index()
+```csharp
+public void Write(MemoryFile mem)
+{
+    var slug = Slugify(mem.Name);
+    var filename = string.IsNullOrEmpty(slug) ? Guid.NewGuid().ToString("n") : slug + ".md";
+    mem.Filename = filename;
+    var path = Path.Combine(_memoryDir, filename);
+    var content = $"---\nname: {mem.Name}\ndescription: {mem.Description}\ntype: {mem.Type}\n---\n\n{mem.Body}\n";
+    File.WriteAllText(path, content);
+    RebuildIndex();
+}
 ```
 
 ### 読み込み：2 つのパス
@@ -80,21 +83,52 @@ def write_memory_file(name, mem_type, description, body):
 
 **パス 2：関連記憶をオンデマンド注入。** 各ユーザーリクエストの開始時に、`load_memories()` は最近の会話と記憶カタログ（name + description）を LLM に軽量 side-query として送信し、関連するファイル名を選択、ファイル内容を読み込んで注入。上限 5 件でコストを制御。
 
-```python
-def select_relevant_memories(messages, max_items=5):
-    files = list_memory_files()
-    if not files:
-        return []
+```csharp
+public async Task<List<string>> SelectRelevantAsync(IReadOnlyList<Message> messages, int maxItems = 5, CancellationToken ct = default)
+{
+    var files = _store.List();
+    if (files.Count == 0) return new List<string>();
 
-    # Build catalog: "0: user-preference-tabs — User prefers tabs..."
-    catalog = "\n".join(f"{i}: {f['name']} — {f['description']}" for i, f in enumerate(files))
+    var recentText = CollectRecentText(messages);
+    if (string.IsNullOrWhiteSpace(recentText)) return new List<string>();
 
-    response = client.messages.create(model=MODEL, messages=[{"role": "user",
-        "content": f"Select relevant memory indices. Return JSON array.\n\n"
-                   f"Recent conversation:\n{recent}\n\nMemory catalog:\n{catalog}"}],
-        max_tokens=200)
-    indices = json.loads(re.search(r'\[.*?\]', response.content[0].text).group())
-    return [files[i]["filename"] for i in indices if 0 <= i < len(files)]
+    // Build catalog: "0: user-preference-tabs — User prefers tabs..."
+    var catalog = string.Join("\n", files.Select((f, i) => $"{i}: {f.Name} — {f.Description}"));
+    var prompt =
+        "Given the recent conversation and the memory catalog below, " +
+        "select the indices of memories that are clearly relevant. " +
+        "Return ONLY a JSON array of integers, e.g. [0, 3]. " +
+        "If none are relevant, return [].\n\n" +
+        $"Recent conversation:\n{recentText}\n\n" +
+        $"Memory catalog:\n{catalog}";
+
+    try
+    {
+        var resp = await _client.CreateMessageAsync(
+            systemPrompt: "You are a memory router.",
+            messages: new List<Message> { Message.UserText(prompt) },
+            tools: null,
+            maxTokensOverride: 200,
+            ct: ct);
+        var text = string.Join("\n", resp.Content.OfType<TextBlock>().Select(t => t.Text)).Trim();
+        var match = Regex.Match(text, @"\[.*?\]", RegexOptions.Singleline);
+        if (match.Success)
+        {
+            var indices = JsonSerializer.Deserialize<List<int>>(match.Value) ?? new();
+            return indices
+                .Where(i => i >= 0 && i < files.Count)
+                .Take(maxItems)
+                .Select(i => files[i].Filename)
+                .ToList();
+        }
+    }
+    catch
+    {
+        // Fall through to keyword fallback
+    }
+
+    return KeywordFallback(recentText, files, maxItems);
+}
 ```
 
 side-query が失敗した場合（API エラー、JSON パース失敗）、name + description のキーワードマッチにフォールバック。
@@ -105,43 +139,64 @@ side-query が失敗した場合（API エラー、JSON パース失敗）、nam
 
 `extract_memories()` は各ターン終了時に実行、モデルが tool_use なしで停止した場合にトリガー（会話が自然な区切りに達したことを示す）：
 
-```python
-# In agent_loop:
-if response.stop_reason != "tool_use":
-    extract_memories(messages)   # 最近の会話から新しい記憶を抽出
-    consolidate_memories()       # 整理が必要かチェック
-    return
+```csharp
+agent.Hooks.OnStop((IReadOnlyList<Message>? history) =>
+{
+    if (history is null || history.Count == 0) return null;
+    _ = Task.Run(async () =>
+    {
+        // In agent_loop: stop_reason != "tool_use" branch
+        var extracted = await extractor.ExtractFromAsync(history);  // Extract new memories
+        if (extracted > 0 || store.List().Count >= 10)
+        {
+            await consolidator.ConsolidateIfNeededAsync();  // Check if consolidation is needed
+        }
+    });
+    return null;
+});
 ```
 
 抽出前に既存の記憶を確認し、重複を回避。抽出プロンプトは LLM に `{name, type, description, body}` の JSON 配列を要求、本当に新しい情報がある場合のみファイルに書き込む。
 
-```python
-def extract_memories(messages):
-    dialogue = format_recent_messages(messages[-10:])
-    existing = "\n".join(f"- {m['name']}: {m['description']}" for m in list_memory_files())
+```csharp
+public async Task<int> ExtractFromAsync(IReadOnlyList<Message> messages, CancellationToken ct = default)
+{
+    var dialogue = new StringBuilder();
+    foreach (var m in messages.TakeLast(10))
+    {
+        var t = string.Join(" ", m.Content.OfType<TextBlock>().Select(b => b.Text));
+        if (!string.IsNullOrWhiteSpace(t))
+        {
+            dialogue.AppendLine($"{m.Role}: {t}");
+        }
+    }
+    if (dialogue.Length == 0) return 0;
 
-    prompt = (
-        "Extract user preferences, constraints, or project facts.\n"
-        "Return JSON array: [{name, type, description, body}].\n"
-        "If nothing new or already covered, return [].\n\n"
-        f"Existing memories:\n{existing}\n\nDialogue:\n{dialogue[:4000]}"
-    )
-    # ... parse response, write files ...
+    var existingDesc = string.Join("\n", _store.List().Select(m => $"- {m.Name}: {m.Description}"));
+
+    var prompt =
+        "Extract user preferences, constraints, or project facts.\n" +
+        "Return JSON array: [{name, type, description, body}].\n" +
+        "If nothing new or already covered, return [].\n\n" +
+        $"Existing memories:\n{existingDesc}\n\nDialogue:\n{dialogue.ToString()[..Math.Min(4000, dialogue.Length)]}";
+    // ... parse response, write files ...
+}
 ```
 
 ### 整理：低頻度の重複排除
 
 記憶ファイルは蓄積される。`consolidate_memories()` はファイル数が閾値（デフォルト 10）に達した時にトリガー、LLM に重複排除、矛盾の統合、古い記憶の剪定を依頼：
 
-```python
-CONSOLIDATE_THRESHOLD = 10
+```csharp
+private const int CONSOLIDATE_THRESHOLD = 10;
 
-def consolidate_memories():
-    files = list_memory_files()
-    if len(files) < CONSOLIDATE_THRESHOLD:
-        return  # 少なすぎる、整理する価値なし
-    # Send all memories to LLM, get back deduplicated list
-    # Replace all files with consolidated results
+public async Task<bool> ConsolidateIfNeededAsync(CancellationToken ct = default)
+{
+    var files = _store.List();
+    if (files.Count < _threshold) return false;  // Too few, not worth consolidating
+    // Send all memories to LLM, get back deduplicated list
+    // Replace all files with consolidated results
+}
 ```
 
 CC はこのプロセスを **Dream** と呼び、実際には 4 層のゲートがある：時間間隔、スキャンスロットル、セッション数、ファイルロック。教学版はファイル数閾値に簡略化。

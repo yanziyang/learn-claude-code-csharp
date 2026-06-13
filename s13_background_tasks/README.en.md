@@ -43,23 +43,26 @@ Sync vs Background:
 
 The model explicitly requests background execution via the bash tool's `run_in_background` parameter. If the model doesn't specify, the teaching version falls back to keyword heuristics:
 
-```python
-def is_slow_operation(tool_name: str, tool_input: dict) -> bool:
-    """Fallback heuristic: commands likely to take > 30s."""
-    if tool_name != "bash":
-        return False
-    cmd = tool_input.get("command", "").lower()
-    slow_keywords = ["install", "build", "test", "deploy", "compile",
-                     "docker build", "dotnet build", "dotnet test",
-                     "dotnet restore", "npm install",
-                     "cargo build", "pytest", "make"]
-    return any(kw in cmd for kw in slow_keywords)
+```csharp
+static bool IsSlowOperation(string toolName, JsonElement toolInput)
+{
+    if (toolName != "bash") return false;
+    var cmd = (toolInput.TryGetProperty("command", out var c) ? c.GetString() : "")
+              ?.ToLowerInvariant() ?? "";
+    string[] slowKeywords = ["install", "build", "test", "deploy", "compile",
+                             "docker build", "dotnet build", "dotnet test",
+                             "dotnet restore", "npm install",
+                             "cargo build", "pytest", "make"];
+    return slowKeywords.Any(kw => cmd.Contains(kw));
+}
 
-def should_run_background(tool_name: str, tool_input: dict) -> bool:
-    """Model explicit request takes priority; fallback to heuristic."""
-    if tool_input.get("run_in_background"):
-        return True
-    return is_slow_operation(tool_name, tool_input)
+static bool ShouldRunBackground(string toolName, JsonElement toolInput)
+{
+    if (toolInput.TryGetProperty("run_in_background", out var rb)
+        && rb.ValueKind == JsonValueKind.True)
+        return true;
+    return IsSlowOperation(toolName, toolInput);
+}
 ```
 
 CC's bash tool schema has a `run_in_background: boolean` parameter (`BashTool.tsx:241`). The model decides which commands go to background, no keyword guessing. The teaching version keeps heuristics as fallback, but the primary path is explicit model request.
@@ -68,33 +71,26 @@ CC's bash tool schema has a `run_in_background: boolean` parameter (`BashTool.ts
 
 Wraps the tool call in a worker function, dispatches to a daemon thread. Each background task gets a unique ID, with state tracked in the `background_tasks` dict:
 
-```python
-_bg_counter = 0
-background_tasks: dict[str, dict] = {}   # bg_id → {tool_use_id, command, status}
-background_results: dict[str, str] = {}   # bg_id → output
-background_lock = threading.Lock()
+```csharp
+int _bgCounter = 0;
+ConcurrentDictionary<string, BackgroundTask> _tasks = new(); // bg_id → {tool_use_id, command, task}
+ConcurrentDictionary<string, string> _results = new();       // bg_id → output
+object _lock = new();
 
-def start_background_task(block) -> str:
-    """Run tool in a daemon thread. Returns background task ID."""
-    global _bg_counter
-    _bg_counter += 1
-    bg_id = f"bg_{_bg_counter:04d}"
+string StartBackgroundTask(ToolUseBlock block)
+{
+    var bgId = $"bg_{Interlocked.Increment(ref _bgCounter):D4}";
 
-    def worker():
-        result = execute_tool(block)
-        with background_lock:
-            background_tasks[bg_id]["status"] = "completed"
-            background_results[bg_id] = result
-
-    with background_lock:
-        background_tasks[bg_id] = {
-            "tool_use_id": block.id,
-            "command": block.input.get("command", ""),
-            "status": "running",
-        }
-    thread = threading.Thread(target=worker, daemon=True)
-    thread.start()
-    return bg_id
+    Task<string> task;
+    lock (_lock)
+    {
+        task = Task.Run(() => ExecuteTool(block));
+        _tasks[bgId] = new BackgroundTask(bgId, block.Id,
+            block.Input.TryGetProperty("command", out var c) ? c.GetString() ?? "" : "",
+            task);
+    }
+    return bgId;
+}
 ```
 
 Returns `bg_id` instead of just `[Running in background...]`. `daemon=True` ensures threads exit when the agent process exits. The teaching version uses in-memory dicts for tracking; real CC has `LocalShellTaskState`, output redirected to files, with full lifecycle including stopping tasks and reading subsequent output.
@@ -103,25 +99,28 @@ Returns `bg_id` instead of just `[Running in background...]`. `daemon=True` ensu
 
 When background tasks complete, results are collected and formatted as `<task_notification>` messages:
 
-```python
-def collect_background_results() -> list[str]:
-    """Collect completed results as task_notification messages."""
-    with background_lock:
-        ready_ids = [bid for bid, task in background_tasks.items()
-                     if task["status"] == "completed"]
-    notifications = []
-    for bg_id in ready_ids:
-        with background_lock:
-            task = background_tasks.pop(bg_id)
-            output = background_results.pop(bg_id, "")
-        notifications.append(
-            f"<task_notification>\n"
-            f"  <task_id>{bg_id}</task_id>\n"
-            f"  <status>completed</status>\n"
-            f"  <command>{task['command']}</command>\n"
-            f"  <summary>{output[:200]}</summary>\n"
-            f"</task_notification>")
-    return notifications
+```csharp
+List<string> CollectBackgroundResults()
+{
+    var notifications = new List<string>();
+    foreach (var (bgId, bt) in _tasks)
+    {
+        if (!bt.Running.IsCompleted) continue;
+        if (!_tasks.TryRemove(bgId, out var task)) continue;
+        string output;
+        try { output = task.Running.Result; }
+        catch (Exception ex) { output = $"Error: {ex.GetType().Name}: {ex.Message}"; }
+        var summary = output.Length > 200 ? output[..200] : output;
+        notifications.Add(
+            $"<task_notification>\n" +
+            $"  <task_id>{bgId}</task_id>\n" +
+            $"  <status>completed</status>\n" +
+            $"  <command>{task.Command}</command>\n" +
+            $"  <summary>{summary}</summary>\n" +
+            $"</task_notification>");
+    }
+    return notifications;
+}
 ```
 
 Notifications don't reuse the original `tool_use_id`. The original tool call was already answered with a placeholder `tool_result`; background completion is an independent event, injected in `task_notification` format. This respects Messages API tool pairing: one `tool_use` gets exactly one `tool_result`.
@@ -130,30 +129,31 @@ Notifications don't reuse the original `tool_use_id`. The original tool call was
 
 In the agent loop, tool execution splits into two paths. Notifications and results merge into a single user message:
 
-```python
-results = []
-for block in response.content:
-    if block.type != "tool_use":
-        continue
-    if should_run_background(block.name, block.input):
-        bg_id = start_background_task(block)
-        results.append({"type": "tool_result",
-            "tool_use_id": block.id,
-            "content": f"[Background task {bg_id} started] "
-                       f"Result will be available when complete."})
-    else:
-        output = execute_tool(block)
-        results.append({"type": "tool_result",
-            "tool_use_id": block.id, "content": output})
+```csharp
+var results = new List<ContentBlock>();
+foreach (var block in response.Content.OfType<ToolUseBlock>())
+{
+    if (ShouldRunBackground(block.Name, block.Input))
+    {
+        var bgId = StartBackgroundTask(block);
+        results.Add(new ToolResultBlock(block.Id,
+            $"[Background task {bgId} started] " +
+            "Result will be available when complete."));
+    }
+    else
+    {
+        var output = ExecuteTool(block);
+        results.Add(new ToolResultBlock(block.Id, output));
+    }
+}
 
-# Merge notifications and tool results into one user message
-user_content = []
-bg_notifications = collect_background_results()
-if bg_notifications:
-    for notif in bg_notifications:
-        user_content.append({"type": "text", "text": notif})
-user_content.extend(results)
-messages.append({"role": "user", "content": user_content})
+// Merge notifications and tool results into one user message
+var userContent = new List<ContentBlock>();
+var bgNotifications = CollectBackgroundResults();
+foreach (var notif in bgNotifications)
+    userContent.Add(new TextBlock(notif));
+userContent.AddRange(results);
+messages.Add(new Message { Role = "user", Content = userContent });
 ```
 
 Slow operations get a placeholder tool_result with `bg_id`, so the LLM knows this command is still running and can do other things first. When background completes, the notification is injected as an independent text block alongside the current turn's tool_results in one user message.

@@ -13,13 +13,12 @@ s01 → s02 → s03 → s04 → s05 → s06 → `s07` → [s08](../s08_context_c
 
 Your project has a React component spec, a SQL style guide, and an API design doc. You want the Agent to follow these specs automatically. The most straightforward idea — stuff them all into the system prompt:
 
-```python
-SYSTEM = (
-    f"You are a coding agent. "
-    + open("docs/react-style.md").read()       # 2000 lines
-    + open("docs/sql-style.md").read()         # 1500 lines
-    + open("docs/api-design.md").read()        # 3000 lines
-)
+```csharp
+var SYSTEM =
+    $"You are a coding agent. "
+    + File.ReadAllText("docs/react-style.md")       // 2000 lines
+    + File.ReadAllText("docs/sql-style.md")         // 1500 lines
+    + File.ReadAllText("docs/api-design.md");       // 3000 lines
 ```
 
 6500 lines of system prompt. The Agent carries these docs on every LLM call — whether it's changing a CSS color or fixing a SQL query. 99% of the content is irrelevant to the current task, burning tokens for nothing.
@@ -57,47 +56,61 @@ skills/
 
 **Level 1: Inject catalog at startup**: the harness calls `_scan_skills()` at startup to scan the skills/ directory, parsing each SKILL.md's YAML frontmatter (`name`, `description`) into a `SKILL_REGISTRY` dictionary. `list_skills()` generates the catalog from the registry, injected into the SYSTEM prompt. The Agent sees "which skills I have available" every turn, with no extra API calls:
 
-```python
-SKILL_REGISTRY: dict[str, dict] = {}
+```csharp
+public sealed class SkillRegistry
+{
+    private readonly Dictionary<string, SkillManifest> _byName = new();
 
-def _scan_skills():
-    if not SKILLS_DIR.exists():
-        return
-    for d in sorted(SKILLS_DIR.iterdir()):
-        if not d.is_dir():
-            continue
-        manifest = d / "SKILL.md"
-        if manifest.exists():
-            raw = manifest.read_text()
-            meta, body = _parse_frontmatter(raw)
-            name = meta.get("name", d.name)
-            desc = meta.get("description", raw.split("\n")[0].lstrip("#").strip())
-            SKILL_REGISTRY[name] = {"name": name, "description": desc, "content": raw}
+    public static SkillRegistry LoadFromDir(string skillsDir)
+    {
+        var reg = new SkillRegistry();
+        if (!Directory.Exists(skillsDir)) return reg;
 
-_scan_skills()  # runs once at startup
+        foreach (var dir in Directory.EnumerateDirectories(skillsDir))
+        {
+            var manifest = Path.Combine(dir, "SKILL.md");
+            if (!File.Exists(manifest)) continue;
 
-def list_skills() -> str:
-    return "\n".join(f"- **{s['name']}**: {s['description']}" for s in SKILL_REGISTRY.values())
+            var raw = File.ReadAllText(manifest);
+            var (name, desc) = ParseFrontmatter(raw);
+            if (string.IsNullOrEmpty(name)) name = Path.GetFileName(dir);
+            reg._byName[name] = new SkillManifest
+            {
+                Name = name,
+                Description = desc,
+                FullContent = raw,
+            };
+        }
+        return reg;
+    }
 
-def build_system() -> str:
-    catalog = list_skills()
-    return (
-        f"You are a coding agent at {WORKDIR}. "
-        f"Skills available:\n{catalog}\n"
-        "Use load_skill to get full details when needed."
-    )
+    public string Catalog() =>
+        string.Join("\n", _byName.Values.Select(s => $"- **{s.Name}**: {s.Description}"));
+}
 
-SYSTEM = build_system()
+public sealed record SkillManifest
+{
+    public string Name { get; init; } = "";
+    public string Description { get; init; } = "";
+    public string FullContent { get; init; } = "";
+}
+
+var skills = SkillRegistry.LoadFromDir(skillsDir);  // runs once at startup
+
+var SYSTEM =
+    $"You are a coding agent at {workDir}. " +
+    "Skills available:\n" + skills.Catalog() + "\n" +
+    "Use load_skill to get full details when needed.";
 ```
 
 **Level 2: load_skill**: the Agent decides "I need the SQL style guide" and calls `load_skill("sql-style")`. Lookup goes through the registry, not file paths, eliminating path traversal risk. The SKILL.md content is injected via `tool_result`, and can include later access to referenced `references/`, `scripts/`, or `assets/` through the existing file and bash tools.
 
-```python
-def load_skill(name: str) -> str:
-    skill = SKILL_REGISTRY.get(name)
-    if not skill:
-        return f"Skill not found: {name}"
-    return skill["content"]
+```csharp
+public static string LoadSkill(string name, SkillRegistry registry)
+{
+    var skill = registry.Get(name);
+    return skill is null ? $"Skill not found: {name}" : skill.FullContent;
+}
 ```
 
 The key distinction: skill content is not part of the system prompt. It enters the current messages as a tool result. Subsequent calls carry it along with the history until context compaction, truncation, or session end. This naturally connects to s08's compact: on-demand loading solves "don't carry what you shouldn't", compact solves "how to drop what you should."

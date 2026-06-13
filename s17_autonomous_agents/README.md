@@ -38,36 +38,47 @@ s16 的队友能通信、能握手关机。但每个队友等 Lead 分配任务�
 
 队友完成当前任务后不退出，进入 IDLE 阶段——每 5 秒检查一次有没有新工作：
 
-```python
-IDLE_POLL_INTERVAL = 5   # seconds
-IDLE_TIMEOUT = 60         # seconds
+```csharp
+const int IdlePollInterval = 5;   // seconds
+const int IdleTimeout = 60;       // seconds
 
-def idle_poll(agent_name, messages, name, role) -> str:
-    """Return 'work', 'shutdown', or 'timeout'."""
-    for _ in range(IDLE_TIMEOUT // IDLE_POLL_INTERVAL):
-        time.sleep(IDLE_POLL_INTERVAL)
+string IdlePoll(MessageBus bus, TaskStore store, string agentName, List<Message> messages)
+{
+    for (var i = 0; i < IdleTimeout / IdlePollInterval; i++)
+    {
+        Thread.Sleep(TimeSpan.FromSeconds(IdlePollInterval));
 
-        # ① 检查收件箱（优先）
-        inbox = BUS.read_inbox(agent_name)
-        if inbox:
-            # shutdown_request 立即处理
-            for msg in inbox:
-                if msg.get("type") == "shutdown_request":
-                    # ... 回复 shutdown_response
-                    return "shutdown"
-            # 普通消息注入上下文，回到 WORK
-            messages.append(...)
-            return "work"
+        var inbox = bus.ReadInbox(agentName);
+        if (inbox.Count > 0)
+        {
+            foreach (var msg in inbox)
+            {
+                if (msg.Type == "shutdown_request")
+                {
+                    bus.Send(agentName, "lead", "Shutting down.", "shutdown_response");
+                    return "shutdown";
+                }
+            }
+            messages.Add(Message.UserText("<inbox>\n" + JsonSerializer.Serialize(inbox) + "\n</inbox>"));
+            return "work";
+        }
 
-        # ② 扫描任务看板
-        unclaimed = scan_unclaimed_tasks()
-        if unclaimed:
-            task = unclaimed[0]
-            result = claim_task(task["id"], agent_name)
-            if "Claimed" in result:
-                messages.append(...)
-                return "work"
-    return "timeout"
+        var candidate = store.List().FirstOrDefault(t =>
+            t.Status == "pending"
+            && string.IsNullOrEmpty(t.Owner)
+            && store.CanStart(t));
+        if (candidate is not null)
+        {
+            var (ok, _) = store.Claim(candidate.Id, agentName);
+            if (ok)
+            {
+                messages.Add(Message.UserText($"<claimed>{candidate.Id}</claimed>"));
+                return "work";
+            }
+        }
+    }
+    return "timeout";
+}
 ```
 
 inbox 优先（可能包含 shutdown_request 等协议消息），任务板其次。IDLE 阶段收到 shutdown_request 会直接回复并退出，不等到下一轮 WORK。
@@ -76,16 +87,16 @@ inbox 优先（可能包含 shutdown_request 等协议消息），任务板其�
 
 找 pending 状态、无 owner、所有依赖已完成（`can_start`）的任务：
 
-```python
-def scan_unclaimed_tasks() -> list[dict]:
-    unclaimed = []
-    for f in sorted(TASKS_DIR.glob("task_*.json")):
-        task = json.loads(f.read_text())
-        if (task.get("status") == "pending"
-                and not task.get("owner")
-                and can_start(task["id"])):
-            unclaimed.append(task)
-    return unclaimed
+```csharp
+List<TaskRecord> ScanUnclaimedTasks(TaskStore store)
+{
+    return store.List()
+        .Where(t => t.Status == "pending"
+                 && string.IsNullOrEmpty(t.Owner)
+                 && store.CanStart(t))
+        .OrderBy(t => t.Id)
+        .ToList();
+}
 ```
 
 三个条件：必须是 pending、没有 owner、所有 blockedBy 依赖已完成。`can_start` 检查依赖任务的状态——有依赖不代表不能做，只有被未完成的任务阻塞才不能做。教学版按文件名排序取第一个；CC 用文件锁防止多个队友同时认领同一个任务。
@@ -94,19 +105,21 @@ def scan_unclaimed_tasks() -> list[dict]:
 
 自动认领时检查 claim 结果，不把失败当成功：
 
-```python
-def claim_task(task_id: str, owner: str = "agent") -> str:
-    task = load_task(task_id)
-    if task.status != "pending":
-        return f"Task {task_id} is {task.status}, cannot claim"
-    if task.owner:
-        return f"Task {task_id} already owned by {task.owner}"
-    if not can_start(task_id):
-        return f"Blocked by: {deps}"
-    task.owner = owner
-    task.status = "in_progress"
-    save_task(task)
-    return f"Claimed {task.id} ({task.subject})"
+```csharp
+string ClaimTask(TaskStore store, string taskId, string owner = "agent")
+{
+    var task = store.Load(taskId);
+    if (task.Status != "pending")
+        return $"Task {taskId} is {task.Status}, cannot claim";
+    if (!string.IsNullOrEmpty(task.Owner))
+        return $"Task {taskId} already owned by {task.Owner}";
+    if (!store.CanStart(task))
+        return $"Blocked by: [{string.Join(", ", task.BlockedBy)}]";
+    task.Owner = owner;
+    task.Status = "in_progress";
+    store.Save(task);
+    return $"Claimed {task.Id} ({task.Subject})";
+}
 ```
 
 教学版没有文件锁，并发认领可能出现竞争。但至少 `task.owner` 检查避免了最明显的"后写覆盖"问题。CC 用 `proper-lockfile` 保护任务文件，`claimTask` 在文件锁内完成读-改-写（`utils/tasks.ts:541-612`）。
@@ -115,25 +128,24 @@ def claim_task(task_id: str, owner: str = "agent") -> str:
 
 s16 的队友做完任务就退出。s17 加了 IDLE 阶段，队友在外层循环中反复 WORK → IDLE：
 
-```python
-# Outer loop: WORK → IDLE cycle
-while True:
-    # WORK phase: 内层循环（最多 10 轮 LLM 调用）
-    for _ in range(10):
-        # 检查 inbox、处理协议消息、调 LLM、执行工具
-        ...
-        if response.stop_reason != "tool_use":
-            break  # WORK 阶段结束
+```csharp
+while (true)
+{
+    for (var i = 0; i < 10; i++)
+    {
+        var resp = await client.CreateMessageAsync(system, messages, tools.AllSpecs().ToList());
+        messages.Add(Message.Assistant(resp.Content));
+        if (resp.StopReason != "tool_use") break;
+        var results = await tools.InvokeAllAsync(resp.Content.OfType<ToolUseBlock>());
+        messages.Add(Message.UserToolResults(results));
+    }
 
-    # IDLE phase
-    idle_result = idle_poll(name, messages, name, role)
-    if idle_result == "shutdown":
-        break
-    if idle_result == "timeout":
-        break  # 60s 超时 → SHUTDOWN
+    var idleResult = IdlePoll(bus, store, name, messages);
+    if (idleResult == "shutdown") break;
+    if (idleResult == "timeout") break;
+}
 
-# SHUTDOWN: 发 summary 给 Lead
-BUS.send(name, "lead", summary, "result")
+bus.Send(name, "lead", summary, "result");
 ```
 
 关键设计：
@@ -146,11 +158,12 @@ BUS.send(name, "lead", summary, "result")
 
 autoCompact（s08）之后，队友的 messages 列表可能被压缩成一段摘要。每次进入新的 WORK 阶段时检查：
 
-```python
-if len(messages) <= 3:
-    messages.insert(0, {"role": "user",
-        "content": f"<identity>You are '{name}', role: {role}. "
-                   f"Continue your work.</identity>"})
+```csharp
+if (messages.Count <= 3)
+{
+    messages.Insert(0, Message.UserText(
+        $"<identity>You are '{name}', role: {role}. Continue your work.</identity>"));
+}
 ```
 
 消息过短说明发生了压缩，此时重新注入身份信息。真实 CC 中 context compaction 会保留 system prompt，教学版的简化实现需要手动处理。

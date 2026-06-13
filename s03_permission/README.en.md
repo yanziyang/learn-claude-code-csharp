@@ -41,80 +41,118 @@ None of the three gates match → execute directly. Most routine operations take
 
 **Gate 1**: A hard deny list. Check first; if matched, return a block message. (Teaching demo: simple string matching is not a reliable security mechanism — command variants and shell expansion can bypass it. CC's approach is in the appendix.)
 
-```python
-DENY_LIST = [
-    "rm -rf /", "sudo", "shutdown", "reboot",
-    "mkfs", "dd if=", "> /dev/sda",
-]
+```csharp
+var denyList = new[] { "rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda" };
 
-def check_deny_list(command: str) -> str | None:
-    for pattern in DENY_LIST:
-        if pattern in command:
-            return f"Blocked: '{pattern}' is on the deny list"
-    return None
+string? CheckDenyList(string command)
+{
+    foreach (var pattern in denyList)
+    {
+        if (command.Contains(pattern, StringComparison.Ordinal))
+            return $"Blocked: '{pattern}' is on the deny list";
+    }
+    return null;
+}
 ```
 
 **Gate 2**: Rule matching — describes "when to ask the user." Each rule specifies a tool and a check condition.
 
-```python
-PERMISSION_RULES = [
+```csharp
+var rules = new List<PermissionRule>
+{
+    new()
     {
-        "tools": ["write_file", "edit_file"],
-        "check": lambda args: not (WORKDIR / args.get("path", "")).resolve().is_relative_to(WORKDIR),
-        "message": "Writing outside workspace",
+        Tools = new[] { "write_file", "edit_file" },
+        Check = args =>
+        {
+            if (args.TryGetProperty("path", out var p) && p.ValueKind == JsonValueKind.String)
+            {
+                try { _ = PathGuard.SafePath(workDir, p.GetString() ?? ""); return null; }
+                catch { return "Writing outside workspace"; }
+            }
+            return null;
+        },
+        Message = "Writing outside workspace",
     },
+    new()
     {
-        "tools": ["bash"],
-        "check": lambda args: any(kw in args.get("command", "") for kw in ["rm ", "> /etc/", "chmod 777"]),
-        "message": "Potentially destructive command",
+        Tools = new[] { "bash" },
+        Check = args =>
+        {
+            if (args.TryGetProperty("command", out var c) && c.ValueKind == JsonValueKind.String)
+            {
+                var cmd = c.GetString() ?? "";
+                if (cmd.Contains("rm ", StringComparison.Ordinal) ||
+                    cmd.Contains("> /etc/", StringComparison.Ordinal) ||
+                    cmd.Contains("chmod 777", StringComparison.Ordinal))
+                    return "Potentially destructive command";
+            }
+            return null;
+        },
+        Message = "Potentially destructive command",
     },
-]
+};
 
-def check_rules(tool_name: str, args: dict) -> str | None:
-    for rule in PERMISSION_RULES:
-        if tool_name in rule["tools"] and rule["check"](args):
-            return rule["message"]
-    return None
+string? CheckRules(string toolName, JsonElement args)
+{
+    foreach (var rule in rules)
+    {
+        if (!rule.Tools.Contains(toolName)) continue;
+        var r = rule.Check(args);
+        if (r is not null) return r;
+    }
+    return null;
+}
 ```
 
 **Gate 3**: After a rule matches, pause for user input.
 
-```python
-def ask_user(tool_name: str, args: dict, reason: str) -> str:
-    print(f"\n⚠  {reason}")
-    print(f"   Tool: {tool_name}({args})")
-    choice = input("   Allow? [y/N] ").strip().lower()
-    return "allow" if choice in ("y", "yes") else "deny"
+```csharp
+string AskUser(string toolName, JsonElement args, string reason)
+{
+    Console.WriteLine($"\n⚠  {reason}");
+    Console.WriteLine($"   Tool: {toolName}({args})");
+    var choice = (Console.ReadLine() ?? "").Trim().ToLowerInvariant();
+    return choice is "y" or "yes" ? "allow" : "deny";
+}
 ```
 
 **All three gates chained together**, inserted before tool execution:
 
-```python
-def check_permission(block) -> bool:
-    # Gate 1: Hard deny
-    if block.name == "bash":
-        reason = check_deny_list(block.input.get("command", ""))
-        if reason:
-            print(f"\n⛔ {reason}")
-            return False
+```csharp
+bool CheckPermission(ToolUseBlock block)
+{
+    if (block.Name == "bash")
+    {
+        var cmd = block.Input.TryGetProperty("command", out var c) ? c.GetString() ?? "" : "";
+        var reason = CheckDenyList(cmd);
+        if (reason is not null)
+        {
+            Console.WriteLine($"\n⛔ {reason}");
+            return false;
+        }
+    }
 
-    # Gate 2 + 3: Rule matching → User approval
-    reason = check_rules(block.name, block.input)
-    if reason:
-        decision = ask_user(block.name, block.input, reason)
-        if decision == "deny":
-            return False
+    var ruleReason = CheckRules(block.Name, block.Input);
+    if (ruleReason is not null)
+    {
+        if (AskUser(block.Name, block.Input, ruleReason) == "deny") return false;
+    }
 
-    return True
+    return true;
+}
 
-# In agent_loop — s02's loop with just one line added:
-for block in response.content:
-    if block.type == "tool_use":
-        if not check_permission(block):           # ← NEW
-            results.append({... "content": "Permission denied."})
-            continue
-        output = TOOL_HANDLERS[block.name](**block.input)  # s02 original
-        results.append(...)
+// In the agent loop — s02 with one line added:
+foreach (var block in response.Content.OfType<ToolUseBlock>())
+{
+    if (!CheckPermission(block))      // ← NEW
+    {
+        results.Add(new ToolResultBlock(block.Id, "Permission denied."));
+        continue;
+    }
+    var output = tools.Invoke(block.Name, block.Input);
+    results.Add(new ToolResultBlock(block.Id, output));
+}
 ```
 
 ---

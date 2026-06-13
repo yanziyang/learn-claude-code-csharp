@@ -44,18 +44,17 @@ Two protocols, one mechanism:
 
 Each protocol request creates a state record tracking who sent it, to whom, current status, and payload:
 
-```python
-@dataclass
-class ProtocolState:
-    request_id: str      # Unique ID, e.g. "req_004281"
-    type: str            # "shutdown" | "plan_approval"
-    sender: str          # Sender
-    target: str          # Recipient
-    status: str          # pending | approved | rejected
-    payload: str         # Plan text or shutdown reason
-    created_at: float    # Timestamp
+```csharp
+public sealed record ProtocolState(
+    string RequestId,    // Unique ID, e.g. "req_004281"
+    string Type,         // "shutdown" | "plan_approval"
+    string Sender,       // Sender
+    string Target,       // Recipient
+    string Status,       // pending | approved | rejected
+    string Payload,      // Plan text or shutdown reason
+    double CreatedAt);   // Timestamp
 
-pending_requests: dict[str, ProtocolState] = {}
+var pendingRequests = new Dictionary<string, ProtocolState>();
 ```
 
 A record is created when sending a request, found via `request_id` when receiving a response, and its status updated.
@@ -90,21 +89,24 @@ Using shutdown as an example, the full chain:
 
 A teammate's inbox receives both plain messages and protocol messages. `handle_inbox_message` dispatches by message type:
 
-```python
-def handle_inbox_message(name, msg, messages):
-    msg_type = msg.get("type", "message")
-    req_id = msg.get("metadata", {}).get("request_id", "")
+```csharp
+bool HandleInboxMessage(string name, MailboxMessage msg, List<Message> messages, MessageBus bus)
+{
+    var msgType = string.IsNullOrEmpty(msg.Type) ? "message" : msg.Type;
 
-    if msg_type == "shutdown_request":
-        BUS.send(name, "lead", "Shutting down.", "shutdown_response",
-                 {"request_id": req_id, "approve": True})
-        return True   # Stop the loop
+    if (msgType == "shutdown_request")
+    {
+        bus.Send(name, "lead", "Shutting down.", "shutdown_response");
+        return true;
+    }
 
-    if msg_type == "plan_approval_response":
-        approve = msg["metadata"].get("approve", False)
-        messages.append({"role": "user",
-            "content": "[Plan approved]" if approve else "[Plan rejected]"})
-    return False       # Continue
+    if (msgType == "plan_approval_response")
+    {
+        var approve = msg.Content.Contains("\"approve\": true", StringComparison.Ordinal);
+        messages.Add(Message.UserText(approve ? "[Plan approved]" : "[Plan rejected]"));
+    }
+    return false;
+}
 ```
 
 Adding a new protocol type means adding a new `if` branch.
@@ -113,18 +115,15 @@ Adding a new protocol type means adding a new `if` branch.
 
 `match_response` doesn't just find state by `request_id`, it also validates that the response type matches the request type:
 
-```python
-def match_response(response_type, request_id, approve):
-    state = pending_requests.get(request_id)
-    if not state:
-        return
-    if state.type == "shutdown" and response_type != "shutdown_response":
-        return  # type mismatch, skip
-    if state.type == "plan_approval" and response_type != "plan_approval_response":
-        return
-    if state.status != "pending":
-        return  # already resolved, skip duplicate
-    state.status = "approved" if approve else "rejected"
+```csharp
+void MatchResponse(string responseType, string requestId, bool approve)
+{
+    if (!pendingRequests.TryGetValue(requestId, out var state)) return;
+    if (state.Type == "shutdown" && responseType != "shutdown_response") return;
+    if (state.Type == "plan_approval" && responseType != "plan_approval_response") return;
+    if (state.Status != "pending") return;
+    pendingRequests[requestId] = state with { Status = approve ? "approved" : "rejected" };
+}
 ```
 
 A shutdown_response cannot accidentally approve a plan_approval request.
@@ -133,17 +132,24 @@ A shutdown_response cannot accidentally approve a plan_approval request.
 
 Both the `check_inbox` tool and the main loop call the same `consume_lead_inbox()` function, routing protocol messages before returning remaining content. This prevents messages from being consumed without protocol state updates:
 
-```python
-def consume_lead_inbox(route_protocol=True) -> list[dict]:
-    msgs = BUS.read_inbox("lead")
-    if route_protocol:
-        for msg in msgs:
-            meta = msg.get("metadata", {})
-            req_id = meta.get("request_id", "")
-            msg_type = msg.get("type", "")
-            if req_id and msg_type.endswith("_response"):
-                match_response(msg_type, req_id, meta.get("approve", False))
-    return msgs
+```csharp
+List<MailboxMessage> ConsumeLeadInbox(MessageBus bus, bool routeProtocol = true)
+{
+    var msgs = bus.ReadInbox("lead");
+    if (routeProtocol)
+    {
+        foreach (var msg in msgs)
+        {
+            if (!msg.Type.EndsWith("_response", StringComparison.Ordinal)) continue;
+            using var doc = JsonDocument.Parse(msg.Content);
+            var reqId = doc.RootElement.TryGetProperty("request_id", out var v) ? v.GetString() ?? "" : "";
+            if (string.IsNullOrEmpty(reqId)) continue;
+            var approve = doc.RootElement.TryGetProperty("approve", out var a) && a.ValueKind == JsonValueKind.True;
+            MatchResponse(msg.Type, reqId, approve);
+        }
+    }
+    return msgs;
+}
 ```
 
 The main loop also injects inbox messages into `history` so the LLM can see and react to them.

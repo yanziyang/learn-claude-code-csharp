@@ -105,11 +105,13 @@ BUILTIN_HANDLERS + mcp__server__tool handlers
 
 权限不写死在工具执行行里，而是作为 `PreToolUse` hook：
 
-```python
-blocked = trigger_hooks("PreToolUse", block)
-if blocked:
-    results.append(tool_result(block.id, blocked))
-    continue
+```csharp
+var blocked = agent.Hooks.TriggerPreToolUse(block);
+if (blocked is not null)
+{
+    results.Add(new ToolResultBlock(block.Id, blocked));
+    continue;
+}
 ```
 
 这样 permission、log、审计都可以挂在同一个 hook 点上。执行后再触发 `PostToolUse`。
@@ -236,13 +238,15 @@ dotnet run --project s20_comprehensive
 
 从 s01 到 s20，代码表面越来越复杂，但核心始终没变：
 
-```python
-while True:
-    response = LLM(messages, tools)
-    if not has_tool_use(response.content):
-        return
-    results = execute_tools(response.content)
-    messages.append(tool_results)
+```csharp
+while (true)
+{
+    var response = await client.CreateMessageAsync(system, messages, tools.AllSpecs().ToList());
+    messages.Add(Message.Assistant(response.Content));
+    if (!response.Content.OfType<ToolUseBlock>().Any()) return;
+    var results = tools.InvokeAll(response.Content.OfType<ToolUseBlock>());
+    messages.Add(Message.UserToolResults(results));
+}
 ```
 
 Claude Code 的复杂性不是“另一个 agent 大脑”，而是一个成熟 harness 的复杂性。模型负责判断和行动选择；harness 负责把环境、工具、权限、记忆、团队和外部能力组织好。

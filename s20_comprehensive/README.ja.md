@@ -105,11 +105,13 @@ BUILTIN_HANDLERS + mcp__server__tool handlers
 
 permission は tool 実行行に直接埋め込まない。`PreToolUse` hook として扱う：
 
-```python
-blocked = trigger_hooks("PreToolUse", block)
-if blocked:
-    results.append(tool_result(block.id, blocked))
-    continue
+```csharp
+var blocked = agent.Hooks.TriggerPreToolUse(block);
+if (blocked is not null)
+{
+    results.Add(new ToolResultBlock(block.Id, blocked));
+    continue;
+}
 ```
 
 これにより permission、logging、audit が同じ hook point に接続できる。実行後には `PostToolUse` hook が走る。
@@ -236,13 +238,15 @@ dotnet run --project s20_comprehensive
 
 s01 から s20 まで、コードの能力は増えていく。しかし中心は変わらない：
 
-```python
-while True:
-    response = LLM(messages, tools)
-    if not has_tool_use(response.content):
-        return
-    results = execute_tools(response.content)
-    messages.append(tool_results)
+```csharp
+while (true)
+{
+    var response = await client.CreateMessageAsync(system, messages, tools.AllSpecs().ToList());
+    messages.Add(Message.Assistant(response.Content));
+    if (!response.Content.OfType<ToolUseBlock>().Any()) return;
+    var results = tools.InvokeAll(response.Content.OfType<ToolUseBlock>());
+    messages.Add(Message.UserToolResults(results));
+}
 ```
 
 Claude Code の複雑さは「別の agent brain」ではない。成熟した harness の複雑さだ。model は判断と action selection を担当する。harness は environment、tools、permissions、memory、teams、external capabilities を整理する。

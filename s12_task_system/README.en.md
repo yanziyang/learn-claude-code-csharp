@@ -48,32 +48,38 @@ TodoWrite vs Task System:
 
 Each task is a JSON file, stored in the `.tasks/` directory:
 
-```python
-@dataclass
-class Task:
-    id: str
-    subject: str
-    description: str
-    status: str          # pending | in_progress | completed
-    owner: str | None    # Agent name (multi-agent scenarios)
-    blockedBy: list[str] # List of dependency task IDs
+```csharp
+public sealed class TaskRecord
+{
+    public string Id { get; set; } = "";
+    public string Subject { get; set; } = "";
+    public string Description { get; set; } = "";
+    public string Status { get; set; } = "pending";   // pending | in_progress | completed
+    public string? Owner { get; set; }                 // Agent name (multi-agent scenarios)
+    public List<string> BlockedBy { get; set; } = new(); // List of dependency task IDs
+}
 ```
 
 IDs are generated with `timestamp + random hex`, simple but sufficient. CC uses sequential IDs + a highwatermark file to prevent ID reuse, which is a more rigorous design.
 
 ### create_task: Create Tasks
 
-```python
-def create_task(subject: str, description: str = "",
-                blockedBy: list[str] | None = None) -> Task:
-    task = Task(
-        id=f"task_{int(time.time())}_{random_hex(4)}",
-        subject=subject, description=description,
-        status="pending", owner=None,
-        blockedBy=blockedBy or [],
-    )
-    save_task(task)
-    return task
+```csharp
+public TaskRecord Create(string subject, string description = "",
+                         IEnumerable<string>? blockedBy = null)
+{
+    var task = new TaskRecord
+    {
+        Id = $"task_{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}_{Random.Shared.Next(0, 9999):D4}",
+        Subject = subject,
+        Description = description,
+        Status = "pending",
+        Owner = null,
+        BlockedBy = blockedBy?.ToList() ?? new(),
+    };
+    Save(task);
+    return task;
+}
 ```
 
 Automatically calls `save_task` on creation to write `.tasks/{id}.json`. `blockedBy` declares dependencies, for example "write API" has `blockedBy: ["task_schema"]`.
@@ -82,16 +88,18 @@ Automatically calls `save_task` on creation to write `.tasks/{id}.json`. `blocke
 
 A task can only start after all its `blockedBy` dependencies are **completed**:
 
-```python
-def can_start(task_id: str) -> bool:
-    task = load_task(task_id)
-    for dep_id in task.blockedBy:
-        if not _task_path(dep_id).exists():
-            return False  # missing dependency = blocked
-        dep = load_task(dep_id)
-        if dep.status != "completed":
-            return False
-    return True
+```csharp
+public bool CanStart(TaskRecord task)
+{
+    foreach (var depId in task.BlockedBy)
+    {
+        var p = PathFor(depId);
+        if (!File.Exists(p)) return false;  // missing dependency = blocked
+        var dep = Load(depId);
+        if (dep.Status != "completed") return false;
+    }
+    return true;
+}
 ```
 
 `can_start` is a prerequisite check for `claim_task`: if any `blockedBy` dependency is not completed, the task cannot be claimed. Missing dependencies are treated as blocked, avoiding crashes from referencing wrong IDs.
@@ -100,19 +108,24 @@ def can_start(task_id: str) -> bool:
 
 When the agent starts working on a task, it calls `claim_task`: sets `owner`, changes status from `pending` → `in_progress`. The `owner` field records who is working on the task, preventing duplicate claims in multi-agent scenarios:
 
-```python
-def claim_task(task_id: str, owner: str = "agent") -> str:
-    task = load_task(task_id)
-    if task.status != "pending":
-        return f"Task {task_id} is {task.status}, cannot claim"
-    if not can_start(task_id):
-        deps = [d for d in task.blockedBy
-                if load_task(d).status != "completed"]
-        return f"Blocked by: {deps}"
-    task.owner = owner
-    task.status = "in_progress"
-    save_task(task)
-    return f"Claimed {task_id} ({task.subject})"
+```csharp
+public (bool ok, string message) Claim(string id, string owner = "agent")
+{
+    var task = Load(id);
+    if (task.Status != "pending")
+        return (false, $"Task {id} is {task.Status}, cannot claim");
+    if (!CanStart(task))
+    {
+        var deps = task.BlockedBy
+            .Where(d => !File.Exists(PathFor(d)) || Load(d).Status != "completed")
+            .ToList();
+        return (false, $"Blocked by: [{string.Join(", ", deps)}]");
+    }
+    task.Owner = owner;
+    task.Status = "in_progress";
+    Save(task);
+    return (true, $"Claimed {task.Id} ({task.Subject})");
+}
 ```
 
 If the task is already claimed by someone else (`status != "pending"`), or dependencies aren't met (`can_start` returns False), the claim is rejected.
@@ -121,19 +134,20 @@ If the task is already claimed by someone else (`status != "pending"`), or depen
 
 When a task is done, set it to `completed`. Simultaneously scan all other tasks to find downstream tasks that were **just unblocked**:
 
-```python
-def complete_task(task_id: str) -> str:
-    task = load_task(task_id)
-    task.status = "completed"
-    save_task(task)
-    # Find newly unblocked downstream tasks
-    unblocked = [t.subject for t in list_tasks()
-                 if t.status == "pending" and t.blockedBy
-                 and can_start(t.id)]
-    msg = f"Completed {task_id} ({task.subject})"
-    if unblocked:
-        msg += f"\nUnblocked: {', '.join(unblocked)}"
-    return msg
+```csharp
+public (bool ok, string message, IReadOnlyList<TaskRecord> unblocked) Complete(string id)
+{
+    var task = Load(id);
+    if (task.Status != "in_progress")
+        return (false, $"Task {id} is {task.Status}, cannot complete", Array.Empty<TaskRecord>());
+    task.Status = "completed";
+    Save(task);
+    // Find newly unblocked downstream tasks
+    var unblocked = List()
+        .Where(t => t.Status == "pending" && t.BlockedBy.Count > 0 && CanStart(t))
+        .ToList();
+    return (true, $"Completed {task.Id} ({task.Subject})", unblocked);
+}
 ```
 
 After completing "schema", `can_start` returns True for "endpoints" and "docs"; they can begin.
@@ -142,10 +156,12 @@ After completing "schema", `can_start` returns True for "endpoints" and "docs"; 
 
 `list_tasks` only shows a one-line summary. `get_task` returns the full task JSON, including description and dependency details. When recovering across sessions, the agent needs to read the full description to continue work:
 
-```python
-def get_task(task_id: str) -> str:
-    task = load_task(task_id)
-    return json.dumps(asdict(task), indent=2)
+```csharp
+public string Get(string id)
+{
+    var task = Load(id);
+    return JsonSerializer.Serialize(task, new JsonSerializerOptions { WriteIndented = true });
+}
 ```
 
 ### State Machine: Two Actions, Three States
@@ -163,25 +179,25 @@ CC has no `in_progress → pending` release path. If a teammate terminates or sh
 
 ### Putting It Together
 
-```python
-# Create tasks with dependencies
-schema = create_task("setup database schema")
-endpoints = create_task("create API endpoints", blockedBy=[schema.id])
-tests = create_task("write tests", blockedBy=[endpoints.id])
-docs = create_task("write docs", blockedBy=[schema.id])
+```csharp
+// Create tasks with dependencies
+var schema = store.Create("setup database schema");
+var endpoints = store.Create("create API endpoints", blockedBy: [schema.Id]);
+var tests = store.Create("write tests", blockedBy: [endpoints.Id]);
+var docs = store.Create("write docs", blockedBy: [schema.Id]);
 
-# Agent claims the first available task
-claim_task(schema.id)       # ✓ Claimed (no dependencies)
-complete_task(schema.id)    # ✓ Completed → unblocks endpoints, docs
+// Agent claims the first available task
+store.Claim(schema.Id);       // ✓ Claimed (no dependencies)
+store.Complete(schema.Id);    // ✓ Completed → unblocks endpoints, docs
 
-claim_task(endpoints.id)    # ✓ Claimed (schema completed)
-complete_task(endpoints.id) # ✓ Completed → unblocks tests
+store.Claim(endpoints.Id);    // ✓ Claimed (schema completed)
+store.Complete(endpoints.Id); // ✓ Completed → unblocks tests
 
-claim_task(docs.id)         # ✓ Claimed (schema completed)
-complete_task(docs.id)      # ✓ Completed
+store.Claim(docs.Id);         // ✓ Claimed (schema completed)
+store.Complete(docs.Id);      // ✓ Completed
 
-claim_task(tests.id)        # ✓ Claimed (endpoints completed)
-complete_task(tests.id)     # ✓ Completed
+store.Claim(tests.Id);        // ✓ Claimed (endpoints completed)
+store.Complete(tests.Id);     // ✓ Completed
 ```
 
 Each `create_task` writes a JSON file, each `claim_task` / `complete_task` updates the file. Across sessions, the `.tasks/` directory persists — the agent reads the files to recover progress.
