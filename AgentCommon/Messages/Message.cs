@@ -3,16 +3,13 @@ using System.Text.Json.Serialization;
 
 namespace AgentCommon.Messages;
 
+[JsonConverter(typeof(ContentBlockConverter))]
 public abstract record ContentBlock
 {
-    [JsonPropertyName("type")]
-    public abstract string Type { get; }
 }
 
 public sealed record TextBlock : ContentBlock
 {
-    public override string Type => "text";
-
     [JsonPropertyName("text")]
     public string Text { get; init; } = "";
 
@@ -22,8 +19,6 @@ public sealed record TextBlock : ContentBlock
 
 public sealed record ToolUseBlock : ContentBlock
 {
-    public override string Type => "tool_use";
-
     [JsonPropertyName("id")]
     public string Id { get; init; } = "";
 
@@ -44,8 +39,6 @@ public sealed record ToolUseBlock : ContentBlock
 
 public sealed record ToolResultBlock : ContentBlock
 {
-    public override string Type => "tool_result";
-
     [JsonPropertyName("tool_use_id")]
     public string ToolUseId { get; init; } = "";
 
@@ -61,6 +54,98 @@ public sealed record ToolResultBlock : ContentBlock
         ToolUseId = toolUseId;
         Content = content;
         IsError = isError;
+    }
+}
+
+public sealed record RawContentBlock : ContentBlock
+{
+    [JsonPropertyName("raw")]
+    public JsonElement Raw { get; init; }
+
+    public RawContentBlock() { }
+    public RawContentBlock(JsonElement raw) { Raw = raw; }
+}
+
+public sealed class ContentBlockConverter : JsonConverter<ContentBlock>
+{
+    public override ContentBlock? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        if (reader.TokenType == JsonTokenType.Null)
+        {
+            return null;
+        }
+
+        using var doc = JsonDocument.ParseValue(ref reader);
+        var root = doc.RootElement;
+
+        if (!root.TryGetProperty("type", out var typeProp) || typeProp.ValueKind != JsonValueKind.String)
+        {
+            return new RawContentBlock(root.Clone());
+        }
+
+        var type = typeProp.GetString();
+        switch (type)
+        {
+            case "text":
+                return new TextBlock
+                {
+                    Text = root.TryGetProperty("text", out var t) && t.ValueKind == JsonValueKind.String ? t.GetString() ?? "" : "",
+                };
+            case "tool_use":
+                return new ToolUseBlock
+                {
+                    Id = root.TryGetProperty("id", out var id) && id.ValueKind == JsonValueKind.String ? id.GetString() ?? "" : "",
+                    Name = root.TryGetProperty("name", out var n) && n.ValueKind == JsonValueKind.String ? n.GetString() ?? "" : "",
+                    Input = root.TryGetProperty("input", out var i) ? i.Clone() : default,
+                };
+            case "tool_result":
+                return new ToolResultBlock
+                {
+                    ToolUseId = root.TryGetProperty("tool_use_id", out var tu) && tu.ValueKind == JsonValueKind.String ? tu.GetString() ?? "" : "",
+                    Content = root.TryGetProperty("content", out var c) ? c.ToString() : "",
+                    IsError = root.TryGetProperty("is_error", out var e) && e.ValueKind == JsonValueKind.True ? (bool?)true : null,
+                };
+            default:
+                return new RawContentBlock(root.Clone());
+        }
+    }
+
+    public override void Write(Utf8JsonWriter writer, ContentBlock value, JsonSerializerOptions options)
+    {
+        switch (value)
+        {
+            case TextBlock t:
+                writer.WriteStartObject();
+                writer.WriteString("type", "text");
+                writer.WriteString("text", t.Text);
+                writer.WriteEndObject();
+                break;
+            case ToolUseBlock tu:
+                writer.WriteStartObject();
+                writer.WriteString("type", "tool_use");
+                writer.WriteString("id", tu.Id);
+                writer.WriteString("name", tu.Name);
+                writer.WritePropertyName("input");
+                tu.Input.WriteTo(writer);
+                writer.WriteEndObject();
+                break;
+            case ToolResultBlock tr:
+                writer.WriteStartObject();
+                writer.WriteString("type", "tool_result");
+                writer.WriteString("tool_use_id", tr.ToolUseId);
+                writer.WriteString("content", tr.Content);
+                if (tr.IsError == true)
+                {
+                    writer.WriteBoolean("is_error", true);
+                }
+                writer.WriteEndObject();
+                break;
+            case RawContentBlock raw:
+                raw.Raw.WriteTo(writer);
+                break;
+            default:
+                throw new JsonException($"Unknown ContentBlock subtype: {value?.GetType().FullName ?? "null"}");
+        }
     }
 }
 

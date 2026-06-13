@@ -106,17 +106,19 @@ public sealed class DeepSeekClient : IDisposable
             payload["tools"] = tools;
         }
 
+        var serializedBody = JsonSerializer.Serialize(payload, JsonOpts);
+        var seq = LlmLogger.NextSeq();
+        await LlmLogger.LogRequestAsync(seq, url, model, serializedBody);
+
         using var req = new HttpRequestMessage(HttpMethod.Post, url);
         req.Headers.Add("x-api-key", apiKey);
         req.Headers.Add("anthropic-version", "2023-06-01");
         req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-        req.Content = new StringContent(
-            JsonSerializer.Serialize(payload, JsonOpts),
-            Encoding.UTF8,
-            "application/json");
+        req.Content = new StringContent(serializedBody, Encoding.UTF8, "application/json");
 
         using var resp = await SharedHttp.SendAsync(req, ct);
         var body = await resp.Content.ReadAsStringAsync(ct);
+        await LlmLogger.LogResponseAsync(seq, (int)resp.StatusCode, body);
 
         if (!resp.IsSuccessStatusCode)
         {
