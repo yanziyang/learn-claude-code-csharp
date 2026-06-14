@@ -2,7 +2,7 @@
 
 [English](./README.md) | [中文](./README-zh.md) | [日本語](./README-ja.md)
 
-## Agency 来自模型，Agent 产品 = 模型 + Harness
+## Agency 来自模型，Agent 产品 = 模型 + Harness (C# Edition)
 
 在讨论代码之前，先把一件事说清楚。
 
