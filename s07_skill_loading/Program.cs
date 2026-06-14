@@ -30,7 +30,8 @@ var config = AgentConfigLoader.Load();
 var client = new DeepSeekClient(config);
 
 var workDir = Directory.GetCurrentDirectory();
-var skillsDir = Path.GetFullPath(Path.Combine(workDir, "..", "skills"));
+var projectDir = AgentConfigLoader.ResolveProjectDir() ?? workDir;
+var skillsDir = Path.GetFullPath(Path.Combine(projectDir, "..", "skills"));
 var skills = SkillRegistry.LoadFromDir(skillsDir);
 
 // ── Parent tools ─────────────────────────────────────────

@@ -77,6 +77,9 @@ var getPrompt = (Dictionary<string, object> ctx) =>
         loaded.Add("memory");
     }
     Console.WriteLine($"  \u001b[32m[assembled] sections: {string.Join(", ", loaded)}\u001b[0m");
+    Console.WriteLine("------ System Prompt -------");
+    Console.WriteLine(lastPrompt);
+    Console.WriteLine("----------------------------");
     return lastPrompt;
 };
 
