@@ -1,7 +1,5 @@
 [English](./README.md) | [中文](./README-zh.md) | [日本語](./README-ja.md)
 
-<a href="https://trendshift.io/repositories/19746" target="_blank"><img src="https://trendshift.io/api/badge/repositories/19746" alt="shareAI-lab%2Flearn-claude-code | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-
 # Learn Claude Code -- Harness Engineering for Real Agents (C# Edition)
 
 > A 20-lesson harness engineering tutorial in .NET 10 / C#. Each chapter
