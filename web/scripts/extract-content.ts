@@ -668,6 +668,11 @@ function main() {
     : buildLegacyVersions();
   const docs = useRootTrack ? buildRootDocs(rootChapters) : buildLegacyDocs();
 
+  if (versions.length === 0 && docs.length === 0) {
+    console.log("\nNo source content found — keeping existing generated files.");
+    return;
+  }
+
   sortVersions(versions);
   computeNewTools(versions);
   const diffs = buildDiffs(versions);

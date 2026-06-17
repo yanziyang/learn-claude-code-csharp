@@ -6,8 +6,11 @@ import { LEARNING_PATH, VERSION_META, LAYERS } from "@/lib/constants";
 import { LayerBadge } from "@/components/ui/badge";
 import { Card } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
-import versionsData from "@/data/generated/versions.json";
+import type { VersionIndex } from "@/types/agent-data";
+import rawVersionsData from "@/data/generated/versions.json";
 import { MessageFlow } from "@/components/architecture/message-flow";
+
+const versionsData = rawVersionsData as VersionIndex;
 
 const LAYER_DOT_COLORS: Record<string, string> = {
   tools: "bg-blue-500",

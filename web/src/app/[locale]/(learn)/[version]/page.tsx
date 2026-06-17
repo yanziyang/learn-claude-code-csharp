@@ -1,9 +1,12 @@
 import Link from "next/link";
 import { LEARNING_PATH, VERSION_META, LAYERS } from "@/lib/constants";
 import { LayerBadge } from "@/components/ui/badge";
-import versionsData from "@/data/generated/versions.json";
+import type { VersionIndex } from "@/types/agent-data";
+import rawVersionsData from "@/data/generated/versions.json";
 import { VersionDetailClient } from "./client";
 import { getTranslations } from "@/lib/i18n-server";
+
+const versionsData = rawVersionsData as VersionIndex;
 
 export function generateStaticParams() {
   return LEARNING_PATH.map((version) => ({ version }));
