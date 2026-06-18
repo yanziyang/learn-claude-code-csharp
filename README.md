@@ -357,7 +357,7 @@ Anthropic-compatible endpoint using `deepseek-v4-flash` as the default
 model.
 
 ```sh
-git clone https://github.com/shareAI-lab/learn-claude-code
+git clone https://github.com/yanziyang/learn-claude-code-csharp
 cd learn-claude-code
 dotnet build                                                # restore + build the whole solution
 
@@ -455,50 +455,6 @@ learn-claude-code/
 ```
 
 ---
-
-## What's Next
-
-After 20 lessons, you understand harness engineering from the inside out. Two paths to turn that knowledge into product:
-
-### Kode Agent CLI -- Open-Source Coding Agent CLI
-
-> `npm i -g @shareai-lab/kode`
-
-Skill and LSP support, Windows compatible, works with GLM / MiniMax / DeepSeek and other open models. Install and go.
-
-GitHub: **[shareAI-lab/Kode-Agent](https://github.com/shareAI-lab/Kode-Agent)**
-
-### Kode Agent SDK -- Embed Agent Capabilities in Your Application
-
-A standalone library with no per-user process overhead. Embed it in backends, browser extensions, embedded devices, or any runtime.
-
-GitHub: **[shareAI-lab/kode-agent-sdk](https://github.com/shareAI-lab/kode-agent-sdk)**
-
----
-
-## Sister Tutorial: From Passive Sessions to Always-On Assistants
-
-The harness taught in this repository is the **use-and-discard** kind -- open a terminal, give the agent a task, close when done, next session starts fresh. Claude Code works this way.
-
-But [OpenClaw](https://github.com/openclaw/openclaw) proves another possibility: on the same agent core, two additional harness mechanisms turn an agent from "poke it and it moves" into "wakes itself every 30 seconds to look for work":
-
-- **Heartbeat** -- every 30 seconds the harness sends the agent a message, letting it check for pending work. Nothing to do? Keep sleeping. Something appeared? Act immediately.
-- **Cron** -- the agent can schedule its own future tasks, which fire automatically when the time arrives.
-
-Add IM multi-channel routing (WhatsApp / Telegram / Slack / Discord and 13+ other platforms), persistent context memory, and a Soul personality system, and the agent transforms from a disposable tool into an always-on personal AI assistant.
-
-**[claw0](https://github.com/shareAI-lab/claw0)** is our sister teaching repository, breaking down these harness mechanisms from scratch:
-
-```
-claw agent = agent core + heartbeat + cron + IM chat + memory + soul
-```
-
-```
-learn-claude-code                   claw0
-(agent harness internals:            (always-on harness:
- loop, tools, planning,               heartbeat, cron, IM channels,
- teams, worktree isolation)            memory, Soul personality)
-```
 
 ## License
 
